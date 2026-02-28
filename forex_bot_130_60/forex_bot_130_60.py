@@ -170,9 +170,143 @@ class Config:
     LOG_DIR = './logs'
     LOG_LEVEL = logging.DEBUG
     ANALYSIS_DIR = './logs/analysis'
-    
+
+    # State persistence file — survives restarts
+    STATE_FILE = './logs/bot_state.json'
+
+    # Hard drawdown circuit breaker (uses persisted high-water mark)
+    MAX_DRAWDOWN_PCT = 0.15  # Halt new trades if down >15% from persisted peak
+
     # Account Currency
     ACCOUNT_CURRENCY = 'GBP'
+
+# ==================== PERSISTENT STATE ====================
+class PersistentState:
+    """Persists critical bot state to disk so it survives restarts."""
+
+    def __init__(self, filepath: str = None):
+        self.filepath = filepath or Config.STATE_FILE
+        self._state = self._load()
+
+    def _load(self) -> Dict:
+        try:
+            if os.path.exists(self.filepath):
+                with open(self.filepath, 'r') as f:
+                    data = json.load(f)
+                logging.getLogger('ForexBot').info(
+                    f"Loaded persisted state: {data.get('total_trades', 0)} trades, "
+                    f"peak={data.get('all_time_peak', 0):.2f}, "
+                    f"W/L={data.get('winning_trades', 0)}/{data.get('losing_trades', 0)}"
+                )
+                return data
+        except Exception as e:
+            logging.getLogger('ForexBot').warning(f"Failed to load state file: {e}")
+        return self._defaults()
+
+    @staticmethod
+    def _defaults() -> Dict:
+        return {
+            'all_time_peak': 0.0,
+            'winning_trades': 0,
+            'losing_trades': 0,
+            'total_trades': 0,
+            'total_pnl': 0.0,
+            'win_amounts': [],
+            'loss_amounts': [],
+            'strategy_performance': {},
+            'trade_ids_seen': [],  # last 200 trade IDs to avoid double-counting
+            'last_updated': None,
+        }
+
+    def save(self):
+        try:
+            os.makedirs(os.path.dirname(self.filepath), exist_ok=True)
+            self._state['last_updated'] = datetime.now().isoformat()
+            # Keep trade_ids_seen bounded
+            if len(self._state.get('trade_ids_seen', [])) > 200:
+                self._state['trade_ids_seen'] = self._state['trade_ids_seen'][-200:]
+            # Keep win/loss amount lists bounded
+            for key in ('win_amounts', 'loss_amounts'):
+                if len(self._state.get(key, [])) > 200:
+                    self._state[key] = self._state[key][-200:]
+            with open(self.filepath, 'w') as f:
+                json.dump(self._state, f, indent=2, default=str)
+        except Exception as e:
+            logging.getLogger('ForexBot').error(f"Failed to save state: {e}")
+
+    def get(self, key: str, default=None):
+        return self._state.get(key, default)
+
+    def set(self, key: str, value):
+        self._state[key] = value
+
+    def update_peak(self, balance: float) -> float:
+        """Update all-time peak and return current drawdown from peak."""
+        peak = self._state.get('all_time_peak', 0.0)
+        if balance > peak:
+            self._state['all_time_peak'] = balance
+            peak = balance
+        dd = (peak - balance) / peak if peak > 0 else 0.0
+        return dd
+
+    def record_trade_result(self, trade_id: str, pnl: float, strategy: str):
+        """Record a closed trade result. Idempotent — skips already-seen trade IDs."""
+        seen = self._state.get('trade_ids_seen', [])
+        if trade_id in seen:
+            return  # Already counted
+        seen.append(trade_id)
+        self._state['trade_ids_seen'] = seen
+
+        self._state['total_trades'] = self._state.get('total_trades', 0) + 1
+        self._state['total_pnl'] = self._state.get('total_pnl', 0.0) + pnl
+
+        if pnl > 0:
+            self._state['winning_trades'] = self._state.get('winning_trades', 0) + 1
+            self._state.setdefault('win_amounts', []).append(pnl)
+        else:
+            self._state['losing_trades'] = self._state.get('losing_trades', 0) + 1
+            self._state.setdefault('loss_amounts', []).append(abs(pnl))
+
+        # Per-strategy tracking
+        sp = self._state.setdefault('strategy_performance', {})
+        if strategy not in sp:
+            sp[strategy] = {'wins': 0, 'losses': 0, 'pnl': 0.0, 'total_trades': 0,
+                            'total_win': 0.0, 'total_loss': 0.0}
+        sp[strategy]['total_trades'] += 1
+        sp[strategy]['pnl'] += pnl
+        if pnl > 0:
+            sp[strategy]['wins'] += 1
+            sp[strategy]['total_win'] += pnl
+        else:
+            sp[strategy]['losses'] += 1
+            sp[strategy]['total_loss'] += abs(pnl)
+
+        self.save()
+
+    def is_drawdown_breached(self, current_balance: float) -> bool:
+        """Check if we've breached the hard drawdown limit from persisted peak."""
+        dd = self.update_peak(current_balance)
+        return dd > Config.MAX_DRAWDOWN_PCT
+
+    @property
+    def win_rate(self) -> float:
+        total = self._state.get('winning_trades', 0) + self._state.get('losing_trades', 0)
+        if total == 0:
+            return 0.0
+        return self._state.get('winning_trades', 0) / total
+
+    @property
+    def expectancy(self) -> float:
+        wins = self._state.get('win_amounts', [])
+        losses = self._state.get('loss_amounts', [])
+        total = len(wins) + len(losses)
+        if total == 0:
+            return 0.0
+        wr = len(wins) / total
+        avg_w = sum(wins) / len(wins) if wins else 0
+        avg_l = sum(losses) / len(losses) if losses else 0
+        return (wr * avg_w) - ((1 - wr) * avg_l)
+
 
 # ==================== DATA CLASSES ====================
 @dataclass
@@ -1193,6 +1327,39 @@ class AdvancedLogger:
     def log_signal(self, signal: SignalRecord):
         self.signals_log.append(signal)
         self._append_to_csv(f"{Config.ANALYSIS_DIR}/signals_log.csv", asdict(signal))
+
+    def update_signal_traded(self, signal_record: 'SignalRecord'):
+        """Update the last matching signal in the CSV to mark it as traded.
+
+        The signals CSV previously always showed traded=False because signals were
+        logged before execution and never updated afterwards. This fixes that by
+        rewriting the last line of the CSV with the updated traded status.
+        """
+        try:
+            csv_path = f"{Config.ANALYSIS_DIR}/signals_log.csv"
+            if not os.path.exists(csv_path):
+                return
+
+            # Read all lines, update the last one matching this signal
+            with open(csv_path, 'r', newline='') as f:
+                lines = f.readlines()
+
+            if len(lines) < 2:
+                return
+
+            # The signal we just executed should be the last (or near last) row
+            # Search from the end for the matching timestamp+symbol+strategy
+            key = f"{signal_record.symbol},{signal_record.strategy},{signal_record.direction}"
+            for i in range(len(lines) - 1, 0, -1):
+                if key in lines[i] and 'False' in lines[i]:
+                    lines[i] = lines[i].replace(',False,', ',True,', 1)
+                    break
+
+            with open(csv_path, 'w', newline='') as f:
+                f.writelines(lines)
+
+        except Exception as e:
+            self.logger.warning(f"Failed to update signal traded status: {e}")
     
     def log_performance(self, snapshot: PerformanceSnapshot):
         self.performance_log.append(snapshot)
@@ -1715,67 +1882,135 @@ class EnhancedMarketAnalyzer:
         return "dead", 0.3
 
     def get_market_regime(self) -> str:
+        """Detect market regime using multiple currency pairs for a broader read.
+
+        Previous version only checked USD_JPY with extreme thresholds (0.5% move,
+        1.5% vol) that almost never triggered — regime was 'neutral' 99.99% of time.
+
+        Now uses USD_JPY (risk proxy) + EUR_USD + AUD_JPY (risk barometer) with
+        realistic thresholds calibrated to actual forex volatility.
+        """
         try:
-            df = self.client.get_candles('USD_JPY', 'H1', count=24)
-            if df.empty or len(df) < 24:
+            # Check multiple pairs for a composite read
+            pairs_data = {}
+            for pair in ['USD_JPY', 'EUR_USD', 'AUD_JPY']:
+                df = self.client.get_candles(pair, 'H1', count=24)
+                if not df.empty and len(df) >= 12:
+                    change_pct = (df['close'].iloc[-1] / df['close'].iloc[-12] - 1) * 100
+                    volatility = df['close'].pct_change().std() * 100
+                    pairs_data[pair] = {'change': change_pct, 'vol': volatility}
+
+            if not pairs_data:
                 return "neutral"
-            
-            change_pct = (df['close'].iloc[-1] / df['close'].iloc[0] - 1) * 100
-            volatility = df['close'].pct_change().std() * 100
-            
-            if change_pct > 0.5 and volatility < 1.0:
-                return "risk_on"
-            elif change_pct < -0.5 and volatility < 1.0:
-                return "risk_off"
-            elif volatility > 1.5:
+
+            # AUD_JPY is the best single-pair risk barometer
+            # Rising = risk-on (carry trade), Falling = risk-off
+            audjpy = pairs_data.get('AUD_JPY', {})
+            usdjpy = pairs_data.get('USD_JPY', {})
+            eurusd = pairs_data.get('EUR_USD', {})
+
+            # Composite risk score: AUD/JPY direction is the primary signal
+            risk_score = 0.0
+            if audjpy:
+                risk_score += audjpy['change'] * 0.5  # AUD/JPY is primary
+            if usdjpy:
+                # Rising USD/JPY = risk-on (yen weakness), calibrated thresholds
+                risk_score += usdjpy['change'] * 0.3
+            if eurusd:
+                risk_score += eurusd['change'] * 0.2
+
+            # Average volatility across pairs
+            avg_vol = np.mean([v['vol'] for v in pairs_data.values()])
+
+            # Calibrated thresholds: 0.15% composite move is meaningful in forex
+            if avg_vol > 0.12:
                 return "volatile"
+            elif risk_score > 0.15:
+                return "risk_on"
+            elif risk_score < -0.15:
+                return "risk_off"
             else:
                 return "neutral"
+
         except Exception as e:
             logger.debug(f"Error detecting market regime: {e}")
             return "neutral"
     
     def get_order_flow_bias(self, symbol: str) -> float:
+        """Estimate order flow bias from price action microstructure.
+
+        Previous version had a dead zone: if price was above VWAP but buying_pressure
+        was <= 0.6 (or below VWAP with buying_pressure >= 0.4), bias returned 0.0.
+        This happened ~80% of the time, making order_flow useless.
+
+        New approach: score multiple independent components and combine them,
+        so partial signals still produce a non-zero reading.
+        """
         try:
             df = self.client.get_candles(symbol, 'M1', count=60)
-            if df.empty or len(df) < 60:
+            if df.empty or len(df) < 30:
                 return 0.0
-            
-            vwap = ((df['high'] + df['low'] + df['close']) / 3).mean()
+
             current_price = df['close'].iloc[-1]
-            
+
+            # Component 1: VWAP position (continuous, not binary)
+            vwap = ((df['high'] + df['low'] + df['close']) / 3).mean()
+            price_range = df['high'].max() - df['low'].min()
+            if price_range > 0:
+                vwap_score = (current_price - vwap) / price_range  # -0.5 to +0.5 range
+            else:
+                vwap_score = 0.0
+
+            # Component 2: Buying pressure (centered at 0.5, scaled to -0.5 to +0.5)
             buying_bars = len(df[df['close'] > df['open']])
-            buying_pressure = buying_bars / len(df)
-            
-            rejections_up = 0
-            rejections_down = 0
-            
+            buying_pressure = (buying_bars / len(df)) - 0.5  # -0.5 to +0.5
+
+            # Component 3: Volume-weighted close position within bar
+            # Bars that close near high = buying, close near low = selling
+            bar_positions = []
+            for _, candle in df.iloc[-20:].iterrows():
+                bar_range = candle['high'] - candle['low']
+                if bar_range > 0:
+                    close_pos = (candle['close'] - candle['low']) / bar_range - 0.5
+                    bar_positions.append(close_pos)
+            close_position_score = np.mean(bar_positions) if bar_positions else 0.0
+
+            # Component 4: Wick rejections (last 10 bars)
+            rejection_score = 0.0
             for i in range(-10, -1):
                 candle = df.iloc[i]
                 body = abs(candle['close'] - candle['open'])
                 upper_wick = candle['high'] - max(candle['close'], candle['open'])
                 lower_wick = min(candle['close'], candle['open']) - candle['low']
-                
                 if body > 0:
                     if upper_wick > body * 2:
-                        rejections_up += 1
+                        rejection_score -= 0.05  # Selling pressure
                     if lower_wick > body * 2:
-                        rejections_down += 1
-            
-            bias = 0.0
-            
-            if current_price > vwap and buying_pressure > 0.6:
-                bias = buying_pressure
-            elif current_price < vwap and buying_pressure < 0.4:
-                bias = -(1 - buying_pressure)
-            
-            if rejections_up > 3:
-                bias -= 0.3
-            if rejections_down > 3:
-                bias += 0.3
-            
-            return np.clip(bias, -1.0, 1.0)
-            
+                        rejection_score += 0.05  # Buying pressure
+
+            # Component 5: Recent momentum (last 5 vs previous 10 bars)
+            recent_close = df['close'].iloc[-5:].mean()
+            earlier_close = df['close'].iloc[-15:-5].mean()
+            if earlier_close > 0:
+                momentum_score = (recent_close / earlier_close - 1) * 100  # Scaled pct
+                momentum_score = np.clip(momentum_score, -0.3, 0.3)
+            else:
+                momentum_score = 0.0
+
+            # Weighted combination
+            bias = (
+                vwap_score * 0.25 +
+                buying_pressure * 0.25 +
+                close_position_score * 0.20 +
+                rejection_score * 0.15 +
+                momentum_score * 0.15
+            )
+
+            # Scale to [-1, 1] — the components sum to roughly [-0.5, 0.5]
+            bias = np.clip(bias * 2.0, -1.0, 1.0)
+
+            return float(bias)
+
         except Exception as e:
             logger.debug(f"Error calculating order flow for {symbol}: {e}")
             return 0.0
@@ -1816,19 +2051,38 @@ class EnhancedMarketAnalyzer:
             return 0.0
         
     def _get_timeframe_trend(self, symbol: str, timeframe: str) -> float:
+        """Calculate trend direction for a single timeframe.
+
+        Previous version returned only -1, 0, or +1 which made the weighted MTF
+        bias collapse to a narrow set of values. Now returns a continuous score
+        from -1 to +1 based on EMA relationship and price position.
+        """
         df = self.get_market_data(symbol, timeframe, bars=200)
         if df.empty or len(df) < 20:
             return 0.0
-        
+
         latest = df.iloc[-1]
-        
+        score = 0.0
+
         if 'ema_9' in df.columns and 'ema_21' in df.columns:
-            if latest['ema_9'] > latest['ema_21'] and latest['close'] > latest['ema_9']:
-                return 1.0
-            elif latest['ema_9'] < latest['ema_21'] and latest['close'] < latest['ema_9']:
-                return -1.0
-        
-        return 0.0
+            # EMA alignment: +/- 0.5
+            if latest['ema_9'] > latest['ema_21']:
+                score += 0.5
+            else:
+                score -= 0.5
+
+            # Price position relative to EMAs: +/- 0.3
+            if latest['close'] > latest['ema_9']:
+                score += 0.3
+            elif latest['close'] < latest['ema_9']:
+                score -= 0.3
+
+            # EMA separation magnitude (normalised by ATR): +/- 0.2
+            if 'atr' in df.columns and latest['atr'] > 0:
+                ema_sep = (latest['ema_9'] - latest['ema_21']) / latest['atr']
+                score += np.clip(ema_sep * 0.1, -0.2, 0.2)
+
+        return np.clip(score, -1.0, 1.0)
     
     def compute_hurst_exponent(self, symbol: str) -> float:
         """Compute rolling Hurst exponent from H1 close data using R/S analysis.
@@ -2409,57 +2663,87 @@ class EnhancedSignalGenerator:
         df = self.analyzer.get_market_data(symbol, Config.TIMEFRAMES['primary'])
         if df.empty or len(df) < 20:
             return None
-        
+
         latest = df.iloc[-1]
-        
+
         if abs(market_condition['multi_tf_bias']) < 0.5:
             return None
-        
+
         momentum = (df['close'].iloc[-1] / df['close'].iloc[-12] - 1)
         if 'JPY' in symbol:
             momentum_pips = momentum * 100
         else:
             momentum_pips = momentum * 10000
-        
+
         if abs(momentum_pips) < 10:
             return None
-        
+
         signal = None
-        confidence = 0.5
-        
+        confidence = 0.30  # Low base — earn it
+
         last_3_bars = df.iloc[-3:]
-        
+
         if momentum_pips > 0 and market_condition['multi_tf_bias'] > 0:
             pullback = last_3_bars['low'].min() < df['close'].iloc[-4]
             if pullback and latest['rsi'] < 70 and market_condition['order_flow'] > -0.3:
                 signal = 'buy'
-                confidence += 0.2
-                
+
+                # Momentum magnitude: stronger momentum = higher confidence
+                if abs(momentum_pips) > 30:
+                    confidence += 0.15
+                elif abs(momentum_pips) > 20:
+                    confidence += 0.10
+                else:
+                    confidence += 0.05
+
+                # RSI not overextended (ideal pullback zone 40-60)
+                if 40 <= latest['rsi'] <= 60:
+                    confidence += 0.10
+                elif latest['rsi'] < 40:
+                    confidence += 0.05  # Deep pullback — riskier
+
                 if market_condition['session_quality'] > 0.8:
-                    confidence += 0.1
-                
+                    confidence += 0.05
+
                 if market_condition['trend_direction'] == 'bullish':
-                    confidence += 0.1
-                
-                confidence += market_condition['multi_tf_bias'] * 0.1
-                    
+                    confidence += 0.10
+
+                confidence += market_condition['multi_tf_bias'] * 0.10
+
+                if market_condition['order_flow'] > 0.2:
+                    confidence += 0.05
+
         elif momentum_pips < 0 and market_condition['multi_tf_bias'] < 0:
             pullback = last_3_bars['high'].max() > df['close'].iloc[-4]
             if pullback and latest['rsi'] > 30 and market_condition['order_flow'] < 0.3:
                 signal = 'sell'
-                confidence += 0.2
-                
+
+                if abs(momentum_pips) > 30:
+                    confidence += 0.15
+                elif abs(momentum_pips) > 20:
+                    confidence += 0.10
+                else:
+                    confidence += 0.05
+
+                if 40 <= latest['rsi'] <= 60:
+                    confidence += 0.10
+                elif latest['rsi'] > 60:
+                    confidence += 0.05
+
                 if market_condition['session_quality'] > 0.8:
-                    confidence += 0.1
-                
+                    confidence += 0.05
+
                 if market_condition['trend_direction'] == 'bearish':
-                    confidence += 0.1
-                
-                confidence += abs(market_condition['multi_tf_bias']) * 0.1
-        
+                    confidence += 0.10
+
+                confidence += abs(market_condition['multi_tf_bias']) * 0.10
+
+                if market_condition['order_flow'] < -0.2:
+                    confidence += 0.05
+
         if not signal:
             return None
-        
+
         return self._create_signal_with_static_targets(
             symbol, signal, 'momentum_pullback', confidence,
             market_condition, df
@@ -2503,47 +2787,87 @@ class EnhancedSignalGenerator:
     def trend_following_signal(self, symbol: str, market_condition: Dict) -> Optional[Dict]:
         if abs(market_condition['trend_strength']) < 0.3:
             return None
-        
+
         if abs(market_condition['multi_tf_bias']) < 0.5:
             return None
-        
+
         df = self.analyzer.get_market_data(symbol, Config.TIMEFRAMES['primary'])
         if df.empty or len(df) < 10:
             return None
-        
+
         latest = df.iloc[-1]
-        
+
         signal = None
-        confidence = 0.5
-        
+        # Start at a LOW base — confidence must be earned by the quality of the setup
+        confidence = 0.30
+
         if len(df) >= 2:
             prev = df.iloc[-2]
-            
+
             macd_cross_up = latest['macd'] > latest['macd_signal'] and prev['macd'] <= prev['macd_signal']
             macd_cross_down = latest['macd'] < latest['macd_signal'] and prev['macd'] >= prev['macd_signal']
-            
+
             momentum_up = latest['momentum'] > 0 and latest['rsi'] > 45
             momentum_down = latest['momentum'] < 0 and latest['rsi'] < 55
-            
+
             if market_condition['trend_direction'] == 'bullish' and market_condition['multi_tf_bias'] > 0:
                 if macd_cross_up or momentum_up:
                     signal = 'buy'
-                    confidence += 0.3
-                    if market_condition['order_flow'] > 0:
-                        confidence += 0.1
-                    confidence += market_condition['multi_tf_bias'] * 0.1
-                        
+
+                    # MACD cross is a stronger signal than just momentum
+                    if macd_cross_up:
+                        confidence += 0.20
+                    if momentum_up:
+                        confidence += 0.10
+
+                    # Order flow alignment (now actually produces values)
+                    of = market_condition['order_flow']
+                    if of > 0.3:
+                        confidence += 0.10
+                    elif of > 0.1:
+                        confidence += 0.05
+
+                    # MTF bias strength (0.5-1.0 range maps to 0.05-0.10)
+                    confidence += market_condition['multi_tf_bias'] * 0.10
+
+                    # Trend strength (0.3-1.0 range maps to 0.03-0.10)
+                    confidence += abs(market_condition['trend_strength']) * 0.10
+
+                    # Regime bonus
+                    if market_condition.get('regime') == 'risk_on':
+                        confidence += 0.05
+
+                    # Session quality
+                    if market_condition['session_quality'] >= 0.9:
+                        confidence += 0.05
+
             elif market_condition['trend_direction'] == 'bearish' and market_condition['multi_tf_bias'] < 0:
                 if macd_cross_down or momentum_down:
                     signal = 'sell'
-                    confidence += 0.3
-                    if market_condition['order_flow'] < 0:
-                        confidence += 0.1
-                    confidence += abs(market_condition['multi_tf_bias']) * 0.1
-        
+
+                    if macd_cross_down:
+                        confidence += 0.20
+                    if momentum_down:
+                        confidence += 0.10
+
+                    of = market_condition['order_flow']
+                    if of < -0.3:
+                        confidence += 0.10
+                    elif of < -0.1:
+                        confidence += 0.05
+
+                    confidence += abs(market_condition['multi_tf_bias']) * 0.10
+                    confidence += abs(market_condition['trend_strength']) * 0.10
+
+                    if market_condition.get('regime') == 'risk_off':
+                        confidence += 0.05
+
+                    if market_condition['session_quality'] >= 0.9:
+                        confidence += 0.05
+
         if not signal:
             return None
-        
+
         return self._create_signal_with_static_targets(
             symbol, signal, 'trend_following', confidence,
             market_condition, df
@@ -2601,46 +2925,74 @@ class EnhancedSignalGenerator:
         df = self.analyzer.get_market_data(symbol, Config.TIMEFRAMES['primary'])
         if df.empty or len(df) < 20:
             return None
-        
+
         latest = df.iloc[-1]
-        
+
         recent_atr = df['atr'].iloc[-5:].mean()
         longer_atr = df['atr'].iloc[-20:].mean()
-        
+
         if recent_atr <= longer_atr * 1.15:
             return None
-        
+
         signal = None
-        confidence = 0.5
-        
+        confidence = 0.30  # Low base
+
+        # ATR expansion magnitude — stronger breakouts get more confidence
+        atr_expansion = recent_atr / longer_atr if longer_atr > 0 else 1.0
+
         if latest['close'] > latest['bb_upper']:
             signal = 'buy'
-            confidence += 0.2
-            if latest['rsi'] > 60 and latest['rsi'] < 80:
-                confidence += 0.1
+
+            # BB breakout is the core signal
+            confidence += 0.15
+
+            # ATR expansion strength
+            if atr_expansion > 1.5:
+                confidence += 0.10
+            elif atr_expansion > 1.25:
+                confidence += 0.05
+
+            # RSI in the right zone (strong but not exhausted)
+            if 60 <= latest['rsi'] <= 75:
+                confidence += 0.10
+            elif 55 <= latest['rsi'] < 60:
+                confidence += 0.05
+
             if market_condition['multi_tf_bias'] > 0:
-                confidence += 0.1
+                confidence += 0.10
+
         elif latest['close'] < latest['bb_lower']:
             signal = 'sell'
-            confidence += 0.2
-            if latest['rsi'] < 40 and latest['rsi'] > 20:
-                confidence += 0.1
+
+            confidence += 0.15
+
+            if atr_expansion > 1.5:
+                confidence += 0.10
+            elif atr_expansion > 1.25:
+                confidence += 0.05
+
+            if 25 <= latest['rsi'] <= 40:
+                confidence += 0.10
+            elif 40 < latest['rsi'] <= 45:
+                confidence += 0.05
+
             if market_condition['multi_tf_bias'] < 0:
-                confidence += 0.1
-        
+                confidence += 0.10
+
         if not signal:
             return None
-        
+
         if latest.get('volume_ratio', 1.0) > 1.5:
-            confidence += 0.1
-        
-        if (signal == 'buy' and market_condition['order_flow'] > 0) or \
-           (signal == 'sell' and market_condition['order_flow'] < 0):
-            confidence += 0.1
-        
+            confidence += 0.05
+
+        # Order flow alignment
+        of = market_condition['order_flow']
+        if (signal == 'buy' and of > 0.2) or (signal == 'sell' and of < -0.2):
+            confidence += 0.05
+
         if confidence < Config.CONFIDENCE_THRESHOLD:
             return None
-        
+
         return self._create_signal_with_static_targets(
             symbol, signal, 'volatility_breakout', confidence,
             market_condition, df
@@ -3094,9 +3446,11 @@ class EnhancedRiskManager:
 
 # ==================== TRADE EXECUTOR ====================
 class EnhancedTradeExecutor:
-    def __init__(self, oanda_client: OandaClient, risk_manager: EnhancedRiskManager):
+    def __init__(self, oanda_client: OandaClient, risk_manager: EnhancedRiskManager,
+                 persistent_state: 'PersistentState' = None):
         self.client = oanda_client
         self.risk_manager = risk_manager
+        self.persistent_state = persistent_state
         self.trade_records = {}
         self.last_trade_time = {}
         self.partial_targets = {}
@@ -3106,7 +3460,7 @@ class EnhancedTradeExecutor:
 
         # Initialize blocked trade tracker
         self.blocked_trade_tracker = BlockedTradeTracker(oanda_client, risk_manager)
-        logger.info("✅ Blocked trade tracking enabled - Will analyze virtual outcomes with position sizing")
+        logger.info("Blocked trade tracking enabled - Will analyze virtual outcomes with position sizing")
     
     def calculate_pnl_pips(self, symbol: str, entry_price: float, exit_price: float, direction: str) -> float:
         """Calculate P&L in pips"""
@@ -3386,10 +3740,11 @@ class EnhancedTradeExecutor:
             self.last_trade_time[symbol] = time.time()
             self.risk_manager.daily_trades += 1
             
-            # Fix logging: mark the signal as traded
+            # Fix logging: mark the signal as traded in memory AND on disk
             if '_signal_record' in signal:
                 signal['_signal_record'].traded = True
                 signal['_signal_record'].not_traded_reason = None
+                advanced_logger.update_signal_traded(signal['_signal_record'])
             
             if signal['strategy'] not in advanced_logger.strategy_performance:
                 advanced_logger.strategy_performance[signal['strategy']] = {
@@ -3577,7 +3932,13 @@ class EnhancedTradeExecutor:
                                     record.duration_minutes = 0
                             
                             self.risk_manager.update_trade_stats(record.pnl, record.strategy)
-                            
+
+                            # Persist to disk (survives restarts)
+                            if self.persistent_state:
+                                self.persistent_state.record_trade_result(
+                                    trade_id, record.pnl, record.strategy
+                                )
+
                             strategy = record.strategy
                             if strategy in advanced_logger.strategy_performance:
                                 perf = advanced_logger.strategy_performance[strategy]
@@ -3735,28 +4096,48 @@ class ProfessionalForexBot:
         self.analyzer = EnhancedMarketAnalyzer(self.oanda_client)
         self.signal_generator = EnhancedSignalGenerator(self.analyzer)
         self.risk_manager = EnhancedRiskManager()
-        self.executor = EnhancedTradeExecutor(self.oanda_client, self.risk_manager)
+        self.state = PersistentState()  # Survives restarts
+        self.executor = EnhancedTradeExecutor(self.oanda_client, self.risk_manager, self.state)
         self.running = False
         self.performance_tracker = {
             'start_balance': 0.0,
             'current_balance': 0.0,
-            'total_trades': 0,
-            'total_pnl': 0.0,
+            'total_trades': self.state.get('total_trades', 0),
+            'total_pnl': self.state.get('total_pnl', 0.0),
             'max_drawdown': 0.0,
-            'peak_balance': 0.0
+            'peak_balance': self.state.get('all_time_peak', 0.0),
         }
         self.last_session = None
+
+        # Restore win/loss stats from persistent state into risk manager
+        for amt in self.state.get('win_amounts', []):
+            self.risk_manager.win_amounts.append(amt)
+            self.risk_manager.winning_trades += 1
+        for amt in self.state.get('loss_amounts', []):
+            self.risk_manager.loss_amounts.append(amt)
+            self.risk_manager.losing_trades += 1
+
+        # Restore strategy performance into signal generator
+        sp = self.state.get('strategy_performance', {})
+        if sp:
+            self.signal_generator.strategy_performance = sp
+            logger.info(f"Restored strategy performance: {list(sp.keys())}")
     
     def initialize(self) -> bool:
         account_info = self.oanda_client.get_account_info()
         if not account_info:
             logger.error("Failed to connect to OANDA")
             return False
-        
+
         balance = float(account_info['balance'])
         self.performance_tracker['start_balance'] = balance
         self.performance_tracker['current_balance'] = balance
-        self.performance_tracker['peak_balance'] = balance
+
+        # Use persisted peak if it's higher than current balance (preserves history)
+        persisted_peak = self.state.get('all_time_peak', 0.0)
+        self.performance_tracker['peak_balance'] = max(balance, persisted_peak)
+        self.state.update_peak(balance)
+        self.state.save()
         
         account_currency = account_info.get('currency', 'USD')
         Config.ACCOUNT_CURRENCY = account_currency
@@ -3829,17 +4210,28 @@ class ProfessionalForexBot:
         account_info = self.oanda_client.get_account_info()
         if not account_info:
             return
-        
+
         current_balance = float(account_info['balance'])
         self.performance_tracker['current_balance'] = current_balance
-        
+
+        # Update persisted peak and drawdown
+        dd_from_peak = self.state.update_peak(current_balance)
         if current_balance > self.performance_tracker['peak_balance']:
             self.performance_tracker['peak_balance'] = current_balance
-        
+
         drawdown = (self.performance_tracker['peak_balance'] - current_balance) / self.performance_tracker['peak_balance']
         if drawdown > self.performance_tracker['max_drawdown']:
             self.performance_tracker['max_drawdown'] = drawdown
-        
+
+        # HARD DRAWDOWN CIRCUIT BREAKER — uses persisted all-time peak
+        if self.state.is_drawdown_breached(current_balance):
+            peak = self.state.get('all_time_peak', 0)
+            logger.warning(
+                f"CIRCUIT BREAKER: Balance {current_balance:.2f} is {dd_from_peak:.1%} below "
+                f"all-time peak {peak:.2f} (limit: {Config.MAX_DRAWDOWN_PCT:.0%}). NO NEW TRADES."
+            )
+            return
+
         session, session_quality = self.analyzer.get_current_session()
         
         can_trade, reason = self.risk_manager.can_trade(current_balance, session_quality)
@@ -3942,16 +4334,22 @@ class ProfessionalForexBot:
     
     def _save_performance_snapshot(self):
         metrics = self.performance_tracker
-        
-        win_rate = 0
-        if self.risk_manager.winning_trades + self.risk_manager.losing_trades > 0:
-            win_rate = self.risk_manager.winning_trades / (self.risk_manager.winning_trades + self.risk_manager.losing_trades)
-        
-        profit_factor = 0
-        if self.risk_manager.loss_amounts:
-            total_wins = sum(self.risk_manager.win_amounts) if self.risk_manager.win_amounts else 0
-            total_losses = sum(self.risk_manager.loss_amounts) if self.risk_manager.loss_amounts else 1
-            profit_factor = total_wins / total_losses if total_losses > 0 else 0
+
+        # Use PERSISTED stats (survive restarts) instead of in-memory only
+        p_wins = self.state.get('winning_trades', 0)
+        p_losses = self.state.get('losing_trades', 0)
+        p_total = p_wins + p_losses
+        win_rate = p_wins / p_total if p_total > 0 else 0
+
+        win_amts = self.state.get('win_amounts', [])
+        loss_amts = self.state.get('loss_amounts', [])
+        total_wins_val = sum(win_amts) if win_amts else 0
+        total_losses_val = sum(loss_amts) if loss_amts else 0
+        profit_factor = total_wins_val / total_losses_val if total_losses_val > 0 else 0
+
+        # Save state periodically
+        self.state.update_peak(metrics['current_balance'])
+        self.state.save()
         
         open_positions = len(self.oanda_client.get_open_positions())
         expectancy = self.risk_manager.calculate_expectancy()
@@ -3971,21 +4369,21 @@ class ProfessionalForexBot:
             equity=metrics['current_balance'],
             daily_pnl=self.risk_manager.daily_pnl,
             daily_return_pct=(self.risk_manager.daily_pnl / metrics['start_balance']) * 100 if metrics['start_balance'] > 0 else 0,
-            total_pnl=metrics['current_balance'] - metrics['start_balance'],
+            total_pnl=self.state.get('total_pnl', 0.0),
             total_return_pct=((metrics['current_balance'] - metrics['start_balance']) / metrics['start_balance']) * 100 if metrics['start_balance'] > 0 else 0,
             open_positions=open_positions,
-            total_trades=metrics['total_trades'],
-            winning_trades=self.risk_manager.winning_trades,
-            losing_trades=self.risk_manager.losing_trades,
+            total_trades=self.state.get('total_trades', 0),
+            winning_trades=p_wins,
+            losing_trades=p_losses,
             win_rate=win_rate,
-            avg_win=np.mean(self.risk_manager.win_amounts) if self.risk_manager.win_amounts else 0,
-            avg_loss=np.mean(self.risk_manager.loss_amounts) if self.risk_manager.loss_amounts else 0,
+            avg_win=np.mean(win_amts) if win_amts else 0,
+            avg_loss=np.mean(loss_amts) if loss_amts else 0,
             profit_factor=profit_factor,
             sharpe_ratio=self.risk_manager.calculate_sharpe_ratio(),
             max_drawdown=metrics['max_drawdown'],
             current_drawdown=(metrics['peak_balance'] - metrics['current_balance']) / metrics['peak_balance'] if metrics['peak_balance'] > 0 else 0,
             kelly_fraction=self.risk_manager._calculate_kelly_fraction(),
-            expectancy=expectancy,
+            expectancy=self.state.expectancy,
             best_session=best_session,
             worst_session=worst_session
         )
@@ -4063,32 +4461,33 @@ class ProfessionalForexBot:
 
     def shutdown(self):
         self.running = False
-        
+
         self._save_performance_snapshot()
-        
+        self.state.save()  # Final state save
+
         analysis_file = advanced_logger.save_daily_analysis()
-        
+
         m = self.performance_tracker
-        total_pnl = m['current_balance'] - m['start_balance']
-        total_return = (total_pnl / m['start_balance']) * 100 if m['start_balance'] > 0 else 0
+        total_pnl = self.state.get('total_pnl', 0.0)
+        total_trades = self.state.get('total_trades', 0)
         currency_symbol = '£' if Config.ACCOUNT_CURRENCY == 'GBP' else '$'
-        
+
         logger.info("=" * 80)
-        logger.info("🎯 BOT — SHUTDOWN SUMMARY")
+        logger.info("BOT — SHUTDOWN SUMMARY")
         logger.info("=" * 80)
         logger.info(f"Start Balance:    {currency_symbol}{m['start_balance']:.2f}")
         logger.info(f"Final Balance:    {currency_symbol}{m['current_balance']:.2f}")
-        logger.info(f"Total P&L:        {currency_symbol}{total_pnl:.2f}")
-        logger.info(f"Total Return:     {total_return:.2f}%")
-        logger.info(f"Total Trades:     {m['total_trades']}")
+        logger.info(f"Session P&L:      {currency_symbol}{m['current_balance'] - m['start_balance']:.2f}")
+        logger.info(f"Lifetime P&L:     {currency_symbol}{total_pnl:.2f}")
+        logger.info(f"Lifetime Trades:  {total_trades}")
+        logger.info(f"All-Time Peak:    {currency_symbol}{self.state.get('all_time_peak', 0):.2f}")
         logger.info(f"Max Drawdown:     {m['max_drawdown']:.2%}")
-        
-        if self.risk_manager.winning_trades + self.risk_manager.losing_trades > 0:
-            win_rate = self.risk_manager.winning_trades / (self.risk_manager.winning_trades + self.risk_manager.losing_trades)
-            logger.info(f"Win Rate:         {win_rate:.1%}")
-        
-        logger.info(f"Sharpe Ratio:     {self.risk_manager.calculate_sharpe_ratio():.2f}")
-        logger.info(f"Expectancy:       {currency_symbol}{self.risk_manager.calculate_expectancy():.2f}")
+
+        wr = self.state.win_rate
+        if wr > 0:
+            logger.info(f"Win Rate:         {wr:.1%} ({self.state.get('winning_trades',0)}W / {self.state.get('losing_trades',0)}L)")
+
+        logger.info(f"Expectancy:       {currency_symbol}{self.state.expectancy:.2f}")
         logger.info(f"Analysis saved:   {analysis_file}")
 
         # Report blocked trade statistics
