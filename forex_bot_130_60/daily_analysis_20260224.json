@@ -1,0 +1,52 @@
+{
+  "date": "2026-02-24",
+  "summary": {
+    "current_balance": 65473.3596,
+    "daily_return": 0.0,
+    "total_return": 0.0,
+    "trades_today": 0,
+    "win_rate": 0,
+    "sharpe_ratio": 0.0,
+    "max_drawdown": 0.0,
+    "profit_factor": 0,
+    "expectancy": 0.0,
+    "best_session": null,
+    "best_strategy": null,
+    "session_stats": {},
+    "strategy_stats": {}
+  },
+  "trades": [],
+  "signals": [],
+  "performance": [
+    {
+      "timestamp": "2026-02-24T19:27:04.994262",
+      "balance": 65473.3596,
+      "equity": 65473.3596,
+      "daily_pnl": 0.0,
+      "daily_return_pct": 0.0,
+      "total_pnl": 0.0,
+      "total_return_pct": 0.0,
+      "open_positions": 6,
+      "total_trades": 0,
+      "winning_trades": 0,
+      "losing_trades": 0,
+      "win_rate": 0,
+      "avg_win": 0,
+      "avg_loss": 0,
+      "profit_factor": 0,
+      "sharpe_ratio": 0.0,
+      "max_drawdown": 0.0,
+      "current_drawdown": 0.0,
+      "kelly_fraction": 0.0,
+      "expectancy": 0.0,
+      "best_session": null,
+      "worst_session": null
+    }
+  ],
+  "session_performance": {},
+  "strategy_performance": {},
+  "recommendations": [
+    "Win rate below 40% - Review entry criteria",
+    "Profit factor below 1.5 - Improve risk/reward ratio"
+  ]
+}
