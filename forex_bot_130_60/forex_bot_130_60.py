@@ -67,6 +67,31 @@ class Config:
     USE_TRAILING_STOP = False
     TRAILING_STOP_ACTIVATION = 1.0
     TRAILING_STOP_DISTANCE = 0.5
+
+    # ===== STEPPED PROFIT LOCK =====
+    # NOT a trailing stop — discrete ratcheting levels that lock in profit.
+    # The trade keeps its original 130-pip TP, but if it reverses after running
+    # deep into the green, the stop catches it at a locked-in profit level.
+    USE_PROFIT_LOCK = True
+    PROFIT_LOCK_LEVELS = [
+        # (trigger_pips, lock_pips) — when profit reaches trigger, move SL to lock
+        (60, 0),     # At +1R (60p profit): move SL to breakeven
+        (80, 30),    # At +80p: lock in 30 pips profit
+        (100, 50),   # At +100p: lock in 50 pips profit
+        (115, 70),   # At +115p: lock in 70 pips (close to 1R captured)
+    ]
+
+    # ===== MOMENTUM-FADE EXIT =====
+    # When a trade is significantly in profit but momentum is dying, close early.
+    # This captures the "it's +80 pips but it's never getting to 130" scenario.
+    USE_MOMENTUM_FADE_EXIT = True
+    MOMENTUM_FADE_MIN_PROFIT_PIPS = 50   # Only consider fade exit if +50 pips
+    MOMENTUM_FADE_RSI_REVERSAL = 15      # RSI moved 15+ points back from extreme
+
+    # ===== POST-TP COOLDOWN =====
+    # After a TP is hit on a pair, don't re-enter the same pair for this many seconds.
+    # Prevents "going to the well" after the move has exhausted.
+    POST_TP_COOLDOWN_SECONDS = 3600  # 60 minutes
     
     # ===== TP/SL CONFIGURATION (130/60) =====
     STATIC_TP_PIPS = 130  # 130 pip take profit
@@ -3453,6 +3478,7 @@ class EnhancedTradeExecutor:
         self.persistent_state = persistent_state
         self.trade_records = {}
         self.last_trade_time = {}
+        self.last_tp_time = {}  # Track when each symbol last hit TP (for cooldown)
         self.partial_targets = {}
         self.trailing_stops = {}
         self.excursion_trackers = {}
@@ -3506,6 +3532,15 @@ class EnhancedTradeExecutor:
         if symbol in self.last_trade_time:
             if time.time() - self.last_trade_time[symbol] < 300:
                 logger.debug(f"Cooldown active for {symbol}")
+                return False
+
+        # POST-TP COOLDOWN: Don't re-enter a pair that just hit TP — the move is exhausted
+        if symbol in self.last_tp_time:
+            elapsed = time.time() - self.last_tp_time[symbol]
+            if elapsed < Config.POST_TP_COOLDOWN_SECONDS:
+                remaining = (Config.POST_TP_COOLDOWN_SECONDS - elapsed) / 60
+                logger.info(f"POST-TP COOLDOWN: {symbol} hit TP {elapsed/60:.0f}m ago, "
+                           f"waiting {remaining:.0f}m more before re-entry")
                 return False
         
         positions = self.client.get_open_positions()
@@ -3920,6 +3955,12 @@ class EnhancedTradeExecutor:
                             record.pnl_pips = self.calculate_pnl_pips(record.symbol, record.entry_price, record.exit_price, record.direction)
                             record.exit_reason = self._determine_exit_reason(trade)
                             record.status = "CLOSED"
+
+                            # Record TP hit time for post-TP cooldown
+                            if record.exit_reason == 'take_profit':
+                                self.last_tp_time[record.symbol] = time.time()
+                                logger.info(f"POST-TP COOLDOWN: {record.symbol} TP hit — "
+                                           f"{Config.POST_TP_COOLDOWN_SECONDS//60}min cooldown started")
                             
                             # Calculate duration using entry_time (or timestamp as fallback)
                             if record.exit_time and record.entry_time:
@@ -4047,6 +4088,135 @@ class EnhancedTradeExecutor:
                 
         except Exception as e:
             logger.error(f"Error tracking excursions: {e}")
+
+    def manage_open_positions(self):
+        """Active management of open positions: stepped profit lock + momentum fade exit.
+
+        This is NOT a trailing stop. It implements two specific exit improvements:
+
+        1. STEPPED PROFIT LOCK: At discrete profit thresholds, ratchet the stop-loss
+           upward to lock in profit. The trade keeps its original 130-pip TP target,
+           but if price reverses, the ratcheted stop catches it at a profit.
+
+        2. MOMENTUM-FADE EXIT: When a trade is significantly in profit (+50p) but
+           momentum indicators show the move is exhausting, close the trade early
+           to capture profit before it reverses back to the original SL.
+        """
+        if not Config.USE_PROFIT_LOCK and not Config.USE_MOMENTUM_FADE_EXIT:
+            return
+
+        trades = self.client.get_open_trades()
+        if not trades:
+            return
+
+        for trade in trades:
+            trade_id = trade['id']
+            symbol = trade['instrument']
+            units = float(trade['currentUnits'])
+            entry_price = float(trade['price'])
+            direction = 'buy' if units > 0 else 'sell'
+
+            # Get current price
+            prices = self.client.get_prices([symbol])
+            if symbol not in prices:
+                continue
+
+            current_price = prices[symbol]['bid'] if direction == 'buy' else prices[symbol]['ask']
+            pip_mult = 100 if 'JPY' in symbol else 10000
+
+            # Calculate current profit in pips
+            if direction == 'buy':
+                profit_pips = (current_price - entry_price) * pip_mult
+            else:
+                profit_pips = (entry_price - current_price) * pip_mult
+
+            # Get current SL from OANDA
+            current_sl = float(trade.get('stopLossOrder', {}).get('price', 0))
+            if current_sl == 0:
+                continue
+
+            pip_value = 0.01 if 'JPY' in symbol else 0.0001
+
+            # --- STEPPED PROFIT LOCK ---
+            if Config.USE_PROFIT_LOCK and profit_pips > 0:
+                for trigger_pips, lock_pips in sorted(Config.PROFIT_LOCK_LEVELS, reverse=True):
+                    if profit_pips >= trigger_pips:
+                        # Calculate the new SL to lock in profit
+                        if direction == 'buy':
+                            new_sl = entry_price + (lock_pips * pip_value)
+                        else:
+                            new_sl = entry_price - (lock_pips * pip_value)
+
+                        # Only move SL if the new one is better (closer to profit)
+                        sl_improved = (
+                            (direction == 'buy' and new_sl > current_sl) or
+                            (direction == 'sell' and new_sl < current_sl)
+                        )
+                        if sl_improved:
+                            new_sl_rounded = round(new_sl, 3 if 'JPY' in symbol else 5)
+                            if self.client.modify_trade(trade_id, stop_loss=new_sl_rounded):
+                                logger.info(
+                                    f"PROFIT LOCK: {symbol} at +{profit_pips:.0f}p — "
+                                    f"SL moved from {current_sl:.5f} to {new_sl_rounded:.5f} "
+                                    f"(locking +{lock_pips}p profit)"
+                                )
+                                current_sl = new_sl_rounded  # Update for fade check below
+                        break  # Only apply highest triggered level
+
+            # --- MOMENTUM-FADE EXIT ---
+            if Config.USE_MOMENTUM_FADE_EXIT and profit_pips >= Config.MOMENTUM_FADE_MIN_PROFIT_PIPS:
+                try:
+                    # Get M5 data for momentum assessment
+                    df = self.client.get_candles(symbol, Config.TIMEFRAMES['primary'], count=30)
+                    if df.empty or len(df) < 20:
+                        continue
+
+                    # Add indicators if not present
+                    if 'rsi' not in df.columns:
+                        close_prices = df['close'].values.astype(float)
+                        df['rsi'] = talib.RSI(close_prices, timeperiod=14)
+                        macd, macd_sig, macd_hist = talib.MACD(close_prices, 12, 26, 9)
+                        df['macd_hist'] = macd_hist
+
+                    latest_rsi = df['rsi'].iloc[-1]
+                    prev_rsi_5 = df['rsi'].iloc[-6]  # RSI 5 bars ago
+                    macd_hist_now = df['macd_hist'].iloc[-1]
+                    macd_hist_prev = df['macd_hist'].iloc[-3]
+
+                    should_fade_exit = False
+                    fade_reason = ""
+
+                    if direction == 'buy':
+                        # Long trade fading: RSI was high and is dropping, MACD hist declining
+                        rsi_reversal = prev_rsi_5 - latest_rsi
+                        macd_declining = macd_hist_now < macd_hist_prev
+                        if rsi_reversal > Config.MOMENTUM_FADE_RSI_REVERSAL and macd_declining:
+                            should_fade_exit = True
+                            fade_reason = f"RSI dropped {rsi_reversal:.0f} pts ({prev_rsi_5:.0f}->{latest_rsi:.0f}), MACD hist declining"
+                    else:
+                        # Short trade fading: RSI was low and is rising, MACD hist rising
+                        rsi_reversal = latest_rsi - prev_rsi_5
+                        macd_rising = macd_hist_now > macd_hist_prev
+                        if rsi_reversal > Config.MOMENTUM_FADE_RSI_REVERSAL and macd_rising:
+                            should_fade_exit = True
+                            fade_reason = f"RSI rose {rsi_reversal:.0f} pts ({prev_rsi_5:.0f}->{latest_rsi:.0f}), MACD hist rising"
+
+                    if should_fade_exit:
+                        logger.info(
+                            f"MOMENTUM FADE EXIT: {symbol} {direction} at +{profit_pips:.0f}p — {fade_reason}"
+                        )
+                        # Close the full position
+                        close_units = str(-int(units)) if direction == 'sell' else str(int(units))
+                        if self.client.close_trade(trade_id, close_units):
+                            logger.info(
+                                f"CLOSED for +{profit_pips:.0f}p profit (was targeting {Config.STATIC_TP_PIPS}p TP). "
+                                f"Momentum fade exit saved potential reversal."
+                            )
+                        else:
+                            logger.warning(f"Failed to close {trade_id} on momentum fade")
+
+                except Exception as e:
+                    logger.debug(f"Momentum fade check error for {trade_id}: {e}")
 
     def calculate_spread_cost(self, symbol: str, prices: Dict) -> float:
         """Calculate the spread cost in price terms"""
@@ -4177,6 +4347,7 @@ class ProfessionalForexBot:
                 if cycle_count % 3 == 0:
                     self.executor.update_closed_trades()
                     self.executor.track_excursions()
+                    self.executor.manage_open_positions()  # Profit lock + momentum fade
                     # Update blocked trades to check for virtual TP/SL hits
                     self.executor.blocked_trade_tracker.update_blocked_trades()
 
