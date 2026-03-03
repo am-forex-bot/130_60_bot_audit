@@ -127,13 +127,43 @@ TRADES = [
     },
 ]
 
-# Profit lock levels: (trigger_pips, lock_pips)
-PROFIT_LOCK_LEVELS = [
-    (60, 0),     # At +60p: move SL to breakeven
-    (80, 30),    # At +80p: lock +30 pips
-    (100, 50),   # At +100p: lock +50 pips
-    (115, 70),   # At +115p: lock +70 pips
+# Profit lock level configurations to test
+# Each config: (name, description, [(trigger_pips, lock_pips), ...])
+PROFIT_LOCK_CONFIGS = [
+    (
+        "Original (60/80/100/115)",
+        "Aggressive — locks early at +60p",
+        [
+            (60, 0),     # At +60p: move SL to breakeven
+            (80, 30),    # At +80p: lock +30 pips
+            (100, 50),   # At +100p: lock +50 pips
+            (115, 70),   # At +115p: lock +70 pips
+        ],
+    ),
+    (
+        "Conservative (100/110/120/125)",
+        "Only locks after 77% of TP reached",
+        [
+            (100, 0),    # At +100p: move SL to breakeven
+            (110, 40),   # At +110p: lock +40 pips
+            (120, 70),   # At +120p: lock +70 pips
+            (125, 90),   # At +125p: lock +90 pips
+        ],
+    ),
+    (
+        "Mid-range (80/100/115/125)",
+        "Balanced — first lock at +80p",
+        [
+            (80, 0),     # At +80p: move SL to breakeven
+            (100, 30),   # At +100p: lock +30 pips
+            (115, 55),   # At +115p: lock +55 pips
+            (125, 80),   # At +125p: lock +80 pips
+        ],
+    ),
 ]
+
+# Default (first config) for backward compat
+PROFIT_LOCK_LEVELS = PROFIT_LOCK_CONFIGS[0][2]
 
 # Momentum fade parameters (calculated on M5 bars)
 FADE_MIN_PROFIT = 50    # pips — must be this far in profit
@@ -323,12 +353,19 @@ def build_m5_indicators(m5_df: pd.DataFrame) -> pd.DataFrame:
 
 # ==================== SIMULATE ====================
 
-def simulate_trade(trade: Dict, s5_df: pd.DataFrame, m5_ind: pd.DataFrame) -> Dict:
+def simulate_trade(trade: Dict, s5_df: pd.DataFrame, m5_ind: pd.DataFrame,
+                   profit_lock_levels: List = None) -> Dict:
     """Simulate a single trade against S5 candle data with all three exit strategies.
 
     Uses S5 bars for price-level checks (SL/TP/profit lock) — 5-second precision.
     Uses pre-computed M5 indicators for momentum fade detection.
+
+    Args:
+        profit_lock_levels: List of (trigger_pips, lock_pips) tuples.
+                           Defaults to PROFIT_LOCK_LEVELS if not provided.
     """
+    if profit_lock_levels is None:
+        profit_lock_levels = PROFIT_LOCK_LEVELS
 
     pair = trade['pair']
     direction = trade['direction']
@@ -471,7 +508,7 @@ def simulate_trade(trade: Dict, s5_df: pd.DataFrame, m5_ind: pd.DataFrame) -> Di
 
         # --- PROFIT LOCK: Check if we should ratchet SL ---
         if not lock_exited:
-            for trigger_pips, lock_pips in sorted(PROFIT_LOCK_LEVELS, reverse=True):
+            for trigger_pips, lock_pips in sorted(profit_lock_levels, reverse=True):
                 if profit_at_best >= trigger_pips:
                     # Calculate new SL
                     if direction == 'buy':
@@ -655,127 +692,193 @@ def main():
         print(f"Expected files in {data_dir}/: " + ", ".join(f"{p}_S5_*.parquet" for p in needed_pairs))
         sys.exit(1)
 
-    # Simulate each trade
+    # Simulate each trade against ALL profit lock configurations
     print("\n" + "=" * 90)
     print("SIMULATING EXIT STRATEGIES — 5-SECOND PRECISION")
+    print(f"Testing {len(PROFIT_LOCK_CONFIGS)} profit lock configurations")
     print("=" * 90)
 
-    results = []
-    for trade in TRADES:
-        pair = trade['pair']
-        if pair not in pair_s5:
-            print(f"\n  Skipping {trade['id']} — no data for {pair}")
-            continue
+    # all_results[config_idx] = list of trade results for that config
+    all_config_results = []
+    config_names = []
 
-        print(f"\n{'─' * 80}")
-        print(f"Trade: {trade['id']} | {pair} {trade['direction'].upper()} @ {trade['entry_price']}")
-        print(f"  Entry: {trade['entry_time']}  |  Actual exit: {trade['actual_exit_reason']} at {trade['actual_exit_time']}")
-        print(f"  Post-TP re-entry: {'YES — WOULD BE BLOCKED BY COOLDOWN' if trade['was_post_tp_reentry'] else 'No'}")
+    for cfg_idx, (cfg_name, cfg_desc, cfg_levels) in enumerate(PROFIT_LOCK_CONFIGS):
+        config_names.append(cfg_name)
+        config_results = []
 
-        result = simulate_trade(trade, pair_s5[pair], pair_m5_ind[pair])
+        if cfg_idx == 0:
+            print(f"\n{'━' * 90}")
+            print(f"  CONFIG {cfg_idx + 1}: {cfg_name}")
+            print(f"  {cfg_desc}")
+            print(f"  Levels: {cfg_levels}")
+            print(f"{'━' * 90}")
 
-        if 'error' in result:
-            print(f"  ERROR: {result['error']}")
-            continue
+        for trade in TRADES:
+            pair = trade['pair']
+            if pair not in pair_s5:
+                if cfg_idx == 0:
+                    print(f"\n  Skipping {trade['id']} — no data for {pair}")
+                continue
 
-        results.append(result)
+            result = simulate_trade(trade, pair_s5[pair], pair_m5_ind[pair],
+                                    profit_lock_levels=cfg_levels)
 
-        # Print excursion analysis
-        print(f"\n  PRICE EXCURSION (5-second precision):")
-        print(f"    Max favorable (MFE): +{result['max_favorable_pips']} pips at {result['max_profit_time']}")
-        print(f"    Max adverse (MAE):   -{result['max_adverse_pips']} pips")
-        green_min = result['seconds_in_green'] // 60
-        red_min = result['seconds_in_red'] // 60
-        print(f"    Time in profit: {green_min}m | Time in loss: {red_min}m | S5 bars processed: {result['total_bars']:,}")
+            if 'error' in result:
+                if cfg_idx == 0:
+                    print(f"\n  ERROR for {trade['id']}: {result['error']}")
+                continue
 
-        # Print profit lock results
-        print(f"\n  PROFIT LOCK:")
-        if result['lock_levels_hit']:
-            for lvl in result['lock_levels_hit']:
-                print(f"    >> HIT {lvl['level']} at {lvl['time']} (profit was +{lvl['profit_at_trigger']}p)")
-        else:
-            print(f"    No lock levels reached (MFE was +{result['max_favorable_pips']}p, first trigger at +60p)")
-        if result['lock_exit_reason']:
-            print(f"    Lock exit: {result['lock_exit_reason']} at {result['lock_exit_pips']:+.1f}p ({result['lock_exit_time']})")
+            config_results.append(result)
 
-        # Print momentum fade results
-        print(f"\n  MOMENTUM FADE:")
-        if result['fade_triggered']:
-            print(f"    >> TRIGGERED at {result['fade_exit_time']} — closed at +{result['fade_exit_pips']}p")
-            print(f"    RSI at trigger: {result['fade_rsi_at_trigger']}")
-        else:
-            print(f"    Not triggered (needed +{FADE_MIN_PROFIT}p profit with RSI reversal of {FADE_RSI_REVERSAL}+)")
+            # Only print detailed per-trade output for the FIRST config
+            # (excursion data is the same regardless of config)
+            if cfg_idx == 0:
+                print(f"\n{'─' * 80}")
+                print(f"Trade: {trade['id']} | {pair} {trade['direction'].upper()} @ {trade['entry_price']}")
+                print(f"  Entry: {trade['entry_time']}  |  Actual exit: {trade['actual_exit_reason']} at {trade['actual_exit_time']}")
+                print(f"  Post-TP re-entry: {'YES — WOULD BE BLOCKED BY COOLDOWN' if trade['was_post_tp_reentry'] else 'No'}")
 
-        # Print comparison table
-        print(f"\n  COMPARISON:")
-        print(f"    {'Strategy':<25} {'Exit Reason':>15} {'Pips':>8} {'vs Actual':>10}")
-        print(f"    {'─' * 60}")
-        actual_pips = result['actual_pnl_pips']
-        print(f"    {'Actual (no changes)':<25} {result['actual_exit']:>15} {actual_pips:>+8.1f} {'—':>10}")
+                print(f"\n  PRICE EXCURSION (5-second precision):")
+                print(f"    Max favorable (MFE): +{result['max_favorable_pips']} pips at {result['max_profit_time']}")
+                print(f"    Max adverse (MAE):   -{result['max_adverse_pips']} pips")
+                green_min = result['seconds_in_green'] // 60
+                red_min = result['seconds_in_red'] // 60
+                print(f"    Time in profit: {green_min}m | Time in loss: {red_min}m | S5 bars processed: {result['total_bars']:,}")
 
-        if result['lock_exit_pips'] is not None:
-            diff = result['lock_exit_pips'] - actual_pips
-            marker = ' <<<' if diff > 5 else ''
-            print(f"    {'With profit lock':<25} {result['lock_exit_reason']:>15} {result['lock_exit_pips']:>+8.1f} {diff:>+10.1f}{marker}")
+                # Print momentum fade results (same for all configs)
+                print(f"\n  MOMENTUM FADE:")
+                if result['fade_triggered']:
+                    print(f"    >> TRIGGERED at {result['fade_exit_time']} — closed at +{result['fade_exit_pips']}p")
+                    print(f"    RSI at trigger: {result['fade_rsi_at_trigger']}")
+                else:
+                    print(f"    Not triggered (needed +{FADE_MIN_PROFIT}p profit with RSI reversal of {FADE_RSI_REVERSAL}+)")
 
-        if result['fade_triggered']:
-            diff = result['fade_exit_pips'] - actual_pips
-            marker = ' <<<' if diff > 5 else ''
-            print(f"    {'With momentum fade':<25} {'momentum_fade':>15} {result['fade_exit_pips']:>+8.1f} {diff:>+10.1f}{marker}")
+        all_config_results.append(config_results)
 
-        if result['combined_exit_pips'] is not None:
-            diff = result['combined_exit_pips'] - actual_pips
-            marker = ' <<<' if diff > 5 else ''
-            print(f"    {'Combined (first exit)':<25} {result['combined_exit_reason']:>15} {result['combined_exit_pips']:>+8.1f} {diff:>+10.1f}{marker}")
+    # ==================== PER-TRADE COMPARISON ACROSS CONFIGS ====================
+    print("\n" + "=" * 90)
+    print("PER-TRADE PROFIT LOCK COMPARISON (all configurations)")
+    print("=" * 90)
+
+    # Build a lookup: config_idx -> trade_id -> result
+    config_trade_map = {}
+    for cfg_idx, results in enumerate(all_config_results):
+        config_trade_map[cfg_idx] = {r['trade_id']: r for r in results}
+
+    # Get trade list from first config
+    if all_config_results:
+        for result in all_config_results[0]:
+            trade_id = result['trade_id']
+            actual_pips = result['actual_pnl_pips']
+
+            print(f"\n{'─' * 80}")
+            print(f"Trade: {trade_id} | {result['pair']} {result['direction'].upper()} @ {result['entry']}")
+            print(f"  MFE: +{result['max_favorable_pips']}p | Actual: {result['actual_exit']} at {actual_pips:+.1f}p")
+
+            # Table header
+            col_w = 18
+            header = f"    {'Config':<35} {'Exit Reason':>15} {'Pips':>8} {'vs Actual':>10}"
+            print(f"\n{header}")
+            print(f"    {'─' * 70}")
+            print(f"    {'Actual (no changes)':<35} {result['actual_exit']:>15} {actual_pips:>+8.1f} {'—':>10}")
+
+            for cfg_idx, (cfg_name, _, cfg_levels) in enumerate(PROFIT_LOCK_CONFIGS):
+                r = config_trade_map[cfg_idx].get(trade_id)
+                if r and r['lock_exit_pips'] is not None:
+                    diff = r['lock_exit_pips'] - actual_pips
+                    marker = ' <<<' if diff > 5 else (' !!!' if diff < -5 else '')
+                    # Show which levels were hit
+                    levels_hit = ', '.join(l['level'] for l in r['lock_levels_hit']) if r['lock_levels_hit'] else 'none'
+                    print(f"    {cfg_name:<35} {r['lock_exit_reason']:>15} {r['lock_exit_pips']:>+8.1f} {diff:>+10.1f}{marker}")
+                    print(f"      Levels hit: {levels_hit}")
 
     # ==================== FINAL SUMMARY ====================
-    if results:
+    if all_config_results and all_config_results[0]:
+        results_base = all_config_results[0]
+        actual_total = sum(r['actual_pnl_pips'] for r in results_base)
+
         print("\n" + "=" * 90)
-        print("OVERALL SUMMARY")
+        print("OVERALL SUMMARY — PROFIT LOCK CONFIGURATIONS COMPARED")
         print("=" * 90)
 
-        actual_total = sum(r['actual_pnl_pips'] for r in results)
-        lock_total = sum(r['lock_exit_pips'] for r in results if r['lock_exit_pips'] is not None)
-        combined_total = sum(r['combined_exit_pips'] for r in results if r['combined_exit_pips'] is not None)
+        # Build summary columns dynamically
+        col_width = max(len(n) for n in config_names) + 2
+        header_cols = ''.join(f"{n:>{col_width}}" for n in config_names)
+        print(f"\n  {'Metric':<30} {'Actual':>10} {header_cols}")
+        print(f"  {'─' * (42 + col_width * len(config_names))}")
 
-        lock_improved = sum(1 for r in results if r['lock_exit_pips'] is not None and r['lock_exit_pips'] > r['actual_pnl_pips'])
-        lock_worse = sum(1 for r in results if r['lock_exit_pips'] is not None and r['lock_exit_pips'] < r['actual_pnl_pips'])
-        lock_same = sum(1 for r in results if r['lock_exit_pips'] is not None and abs(r['lock_exit_pips'] - r['actual_pnl_pips']) < 0.5)
-        fade_count = sum(1 for r in results if r['fade_triggered'])
+        # Total pips per config
+        config_totals = []
+        for cfg_idx, results in enumerate(all_config_results):
+            total = sum(r['lock_exit_pips'] for r in results if r['lock_exit_pips'] is not None)
+            config_totals.append(total)
 
-        print(f"\n  {'Metric':<35} {'Actual':>10} {'Profit Lock':>12} {'Combined':>10}")
-        print(f"  {'─' * 70}")
-        print(f"  {'Total pips':<35} {actual_total:>+10.1f} {lock_total:>+12.1f} {combined_total:>+10.1f}")
-        print(f"  {'Improvement over actual':<35} {'—':>10} {lock_total - actual_total:>+12.1f} {combined_total - actual_total:>+10.1f}")
-        print(f"  {'Trades improved':<35} {'':>10} {lock_improved:>12} {'':>10}")
-        print(f"  {'Trades same outcome':<35} {'':>10} {lock_same:>12} {'':>10}")
-        print(f"  {'Trades worse':<35} {'':>10} {lock_worse:>12} {'':>10}")
-        print(f"  {'Momentum fade triggers':<35} {'':>10} {'':>12} {fade_count:>10}")
+        total_line = ''.join(f"{t:>+{col_width}.1f}" for t in config_totals)
+        print(f"  {'Total pips':<30} {actual_total:>+10.1f} {total_line}")
 
-        # Post-TP cooldown impact
-        print(f"\n  POST-TP COOLDOWN (60 min, independent of above):")
-        cooldown_blocked = [r for r in results if r['was_post_tp_reentry']]
+        imp_line = ''.join(f"{(t - actual_total):>+{col_width}.1f}" for t in config_totals)
+        print(f"  {'Improvement over actual':<30} {'—':>10} {imp_line}")
+
+        # Trades improved / same / worse per config
+        for label, cond_fn in [
+            ("Trades improved", lambda r: r['lock_exit_pips'] is not None and r['lock_exit_pips'] > r['actual_pnl_pips'] + 0.5),
+            ("Trades same outcome", lambda r: r['lock_exit_pips'] is not None and abs(r['lock_exit_pips'] - r['actual_pnl_pips']) <= 0.5),
+            ("Trades worse", lambda r: r['lock_exit_pips'] is not None and r['lock_exit_pips'] < r['actual_pnl_pips'] - 0.5),
+        ]:
+            vals = ''.join(f"{sum(1 for r in results if cond_fn(r)):>{col_width}}" for results in all_config_results)
+            print(f"  {label:<30} {'':>10} {vals}")
+
+        # Show which winning trades were protected vs cut short
+        print(f"\n  IMPACT ON WINNING TRADES (trades that actually hit TP):")
+        print(f"  {'─' * (42 + col_width * len(config_names))}")
+        for result in results_base:
+            if result['actual_exit'] != 'TP':
+                continue
+            tid = result['trade_id']
+            actual_pips = result['actual_pnl_pips']
+            vals = []
+            for cfg_idx in range(len(PROFIT_LOCK_CONFIGS)):
+                r = config_trade_map[cfg_idx].get(tid)
+                if r and r['lock_exit_pips'] is not None:
+                    diff = r['lock_exit_pips'] - actual_pips
+                    vals.append(f"{diff:>+{col_width}.1f}")
+                else:
+                    vals.append(f"{'N/A':>{col_width}}")
+            vals_str = ''.join(vals)
+            print(f"  {tid:<30} {actual_pips:>+10.1f} {vals_str}")
+
+        # Post-TP cooldown (same regardless of config)
+        print(f"\n  POST-TP COOLDOWN (60 min, independent of profit lock config):")
+        cooldown_blocked = [r for r in results_base if r['was_post_tp_reentry']]
         cooldown_saved_pips = sum(abs(r['actual_pnl_pips']) for r in cooldown_blocked if r['actual_pnl_pips'] < 0)
         for r in cooldown_blocked:
             print(f"    BLOCKED: {r['trade_id']} — would have saved {abs(r['actual_pnl_pips']):.1f} pips (£{abs(r['actual_pnl_gbp']):.0f})")
         print(f"    Total trades blocked: {len(cooldown_blocked)}")
         print(f"    Total pips saved: +{cooldown_saved_pips:.1f}")
 
-        # Grand total
-        all_improvement = (combined_total - actual_total) + cooldown_saved_pips
-        print(f"\n  {'=' * 60}")
-        print(f"  GRAND TOTAL (all strategies combined): {all_improvement:+.1f} pips improvement")
-        print(f"  {'=' * 60}")
+        # Grand total for each config
+        print(f"\n  {'=' * (42 + col_width * len(config_names))}")
+        grand_line = ''.join(f"{(t - actual_total + cooldown_saved_pips):>+{col_width}.1f}" for t in config_totals)
+        print(f"  {'GRAND TOTAL (lock + cooldown)':<30} {'':>10} {grand_line}")
+        print(f"  {'=' * (42 + col_width * len(config_names))}")
 
-    # Save results
+    # Save results (all configs)
     output_file = os.path.join(data_dir, 'simulation_results.json')
-    clean_results = [{k: v for k, v in r.items() if k != 'bar_trace'} for r in results]
+    save_data = {}
+    for cfg_idx, (cfg_name, cfg_desc, cfg_levels) in enumerate(PROFIT_LOCK_CONFIGS):
+        clean_results = [{k: v for k, v in r.items() if k != 'bar_trace'} for r in all_config_results[cfg_idx]]
+        save_data[cfg_name] = {
+            "description": cfg_desc,
+            "levels": cfg_levels,
+            "results": clean_results,
+        }
     with open(output_file, 'w') as f:
-        json.dump(clean_results, f, indent=2, default=str)
+        json.dump(save_data, f, indent=2, default=str)
     print(f"\n  Detailed results saved to: {output_file}")
 
+    # Save bar traces (only from first config — excursion data is identical)
     trace_file = os.path.join(data_dir, 'bar_traces.json')
-    traces = {r['trade_id']: r['bar_trace'] for r in results}
+    traces = {r['trade_id']: r['bar_trace'] for r in all_config_results[0]} if all_config_results else {}
     with open(trace_file, 'w') as f:
         json.dump(traces, f, indent=2, default=str)
     print(f"  Per-minute profit traces saved to: {trace_file}")
