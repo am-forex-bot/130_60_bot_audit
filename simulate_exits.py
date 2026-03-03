@@ -4,16 +4,18 @@ Simulate stepped profit lock + momentum fade exit on real tick/candle data.
 
 USAGE:
   1. Download M5 (5-minute) candle data from OANDA for the pairs you traded.
-     Export as CSV with columns: time, open, high, low, close, volume
-     (or use the OANDA API script below)
+     Supports Parquet, Feather, or CSV formats.
 
-  2. Place the CSV files in a folder, named like:
-       GBP_USD_M5.csv
-       AUD_USD_M5.csv
-       EUR_USD_M5.csv
-       EUR_GBP_M5.csv
+  2. Place the data files in a folder, named like:
+       GBP_USD_M5.parquet   (or .feather or .csv)
+       AUD_USD_M5.parquet
+       EUR_USD_M5.parquet
+       EUR_GBP_M5.parquet
+     Also accepts: GBPUSD_M5.parquet, GBP_USD.parquet, etc.
 
   3. Run:  python3 simulate_exits.py ./data_folder/
+
+  Requirements for Parquet/Feather: pip install pandas pyarrow
 
   The script will replay every bar for each trade and tell you exactly:
   - Did the trade reach each profit lock level?
@@ -28,6 +30,12 @@ ALTERNATIVE — OANDA API DOWNLOAD:
 import csv
 import os
 import sys
+
+try:
+    import pandas as pd
+    HAS_PANDAS = True
+except ImportError:
+    HAS_PANDAS = False
 import json
 import numpy as np
 from datetime import datetime, timedelta
@@ -208,77 +216,163 @@ def _ema(data, period):
 
 # ==================== LOAD M5 DATA ====================
 
-def load_m5_data(data_dir: str, pair: str) -> List[Dict]:
-    """Load M5 candle data from CSV.
-
-    Expected CSV format (OANDA export or custom):
-      time,open,high,low,close,volume
-      2026-03-02 00:00:00,1.33450,1.33480,1.33420,1.33460,150
-
-    Also supports:
-      datetime,o,h,l,c,volume  (OANDA API format)
-      Date,Open,High,Low,Close,Volume  (MT4/MT5 export)
-    """
-    # Try different filename patterns
-    filenames = [
-        f"{pair}_M5.csv",
-        f"{pair.replace('_', '')}_M5.csv",
-        f"{pair}_5min.csv",
-        f"{pair}.csv",
-    ]
-
-    filepath = None
-    for fn in filenames:
-        fp = os.path.join(data_dir, fn)
-        if os.path.exists(fp):
-            filepath = fp
+def _detect_columns(headers):
+    """Detect OHLC and time column names from headers (case-insensitive)."""
+    headers_lower = [h.lower() for h in headers]
+    time_col = None
+    for h, hl in zip(headers, headers_lower):
+        if hl in ('time', 'datetime', 'date', 'timestamp'):
+            time_col = h
             break
+    if not time_col:
+        time_col = headers[0]
 
-    if not filepath:
-        print(f"  WARNING: No M5 data found for {pair} in {data_dir}")
-        print(f"  Tried: {', '.join(filenames)}")
+    open_col = next((h for h, hl in zip(headers, headers_lower) if hl in ('open', 'o', 'mid_o', 'mid.o')), None)
+    high_col = next((h for h, hl in zip(headers, headers_lower) if hl in ('high', 'h', 'mid_h', 'mid.h')), None)
+    low_col = next((h for h, hl in zip(headers, headers_lower) if hl in ('low', 'l', 'mid_l', 'mid.l')), None)
+    close_col = next((h for h, hl in zip(headers, headers_lower) if hl in ('close', 'c', 'mid_c', 'mid.c')), None)
+
+    return time_col, open_col, high_col, low_col, close_col
+
+
+def _df_to_candles(df) -> List[Dict]:
+    """Convert a pandas DataFrame to list of candle dicts."""
+    headers = list(df.columns)
+    time_col, open_col, high_col, low_col, close_col = _detect_columns(headers)
+
+    if not all([open_col, high_col, low_col, close_col]):
+        print(f"  ERROR: Can't identify OHLC columns")
+        print(f"  Columns found: {headers}")
         return []
 
     candles = []
-    with open(filepath, 'r') as f:
-        reader = csv.DictReader(f)
-        headers = reader.fieldnames
-
-        # Detect column names
-        time_col = next((h for h in headers if h.lower() in ('time', 'datetime', 'date', 'timestamp')), headers[0])
-        open_col = next((h for h in headers if h.lower() in ('open', 'o')), None)
-        high_col = next((h for h in headers if h.lower() in ('high', 'h')), None)
-        low_col = next((h for h in headers if h.lower() in ('low', 'l')), None)
-        close_col = next((h for h in headers if h.lower() in ('close', 'c')), None)
-
-        if not all([open_col, high_col, low_col, close_col]):
-            print(f"  ERROR: Can't identify OHLC columns in {filepath}")
-            print(f"  Headers found: {headers}")
-            return []
-
-        for row in reader:
-            try:
-                ts = row[time_col].strip()
-                # Try multiple datetime formats
+    for _, row in df.iterrows():
+        try:
+            ts = row[time_col]
+            if isinstance(ts, str):
                 for fmt in ('%Y-%m-%d %H:%M:%S', '%Y-%m-%dT%H:%M:%S', '%Y.%m.%d %H:%M',
                             '%Y-%m-%dT%H:%M:%S.%fZ', '%Y-%m-%d %H:%M'):
                     try:
-                        dt = datetime.strptime(ts, fmt)
+                        dt = datetime.strptime(ts.strip(), fmt)
                         break
                     except ValueError:
                         continue
                 else:
-                    continue  # Skip unparseable rows
+                    continue
+            else:
+                dt = pd.Timestamp(ts).to_pydatetime()
 
-                candles.append({
-                    'time': dt,
-                    'open': float(row[open_col]),
-                    'high': float(row[high_col]),
-                    'low': float(row[low_col]),
-                    'close': float(row[close_col]),
-                })
-            except (ValueError, KeyError):
-                continue
+            candles.append({
+                'time': dt,
+                'open': float(row[open_col]),
+                'high': float(row[high_col]),
+                'low': float(row[low_col]),
+                'close': float(row[close_col]),
+            })
+        except (ValueError, KeyError, TypeError):
+            continue
+
+    return candles
+
+
+def load_m5_data(data_dir: str, pair: str) -> List[Dict]:
+    """Load M5 candle data from Parquet, Feather, or CSV.
+
+    Supports multiple file formats and naming conventions:
+      Parquet:  GBP_USD_M5.parquet, GBPUSD_M5.parquet, GBP_USD.parquet
+      Feather:  GBP_USD_M5.feather, GBPUSD_M5.feather, GBP_USD.feather
+      CSV:      GBP_USD_M5.csv, GBPUSD_M5.csv, GBP_USD.csv
+
+    Columns auto-detected (case-insensitive):
+      time/datetime/date/timestamp, open/o/mid_o, high/h/mid_h, low/l/mid_l, close/c/mid_c
+    """
+    # Build filename patterns: base names × extensions
+    bases = [
+        f"{pair}_M5",
+        f"{pair.replace('_', '')}_M5",
+        f"{pair}_5min",
+        f"{pair}",
+        f"{pair.replace('_', '')}",
+    ]
+    extensions = ['.parquet', '.feather', '.csv']
+
+    filepath = None
+    for base in bases:
+        for ext in extensions:
+            fp = os.path.join(data_dir, base + ext)
+            if os.path.exists(fp):
+                filepath = fp
+                break
+        if filepath:
+            break
+
+    if not filepath:
+        all_tried = [b + e for b in bases for e in extensions]
+        print(f"  WARNING: No M5 data found for {pair} in {data_dir}")
+        print(f"  Tried: {', '.join(all_tried[:6])}...")
+        return []
+
+    ext = os.path.splitext(filepath)[1].lower()
+
+    # --- Parquet / Feather (need pandas) ---
+    if ext in ('.parquet', '.feather'):
+        if not HAS_PANDAS:
+            print(f"  ERROR: Found {filepath} but pandas is not installed.")
+            print(f"  Install with: pip install pandas pyarrow")
+            return []
+
+        print(f"  Reading {ext[1:].upper()}: {os.path.basename(filepath)}")
+        try:
+            if ext == '.parquet':
+                df = pd.read_parquet(filepath)
+            else:
+                df = pd.read_feather(filepath)
+        except Exception as e:
+            print(f"  ERROR reading {filepath}: {e}")
+            return []
+
+        # If the index is a DatetimeIndex, bring it into columns
+        if isinstance(df.index, pd.DatetimeIndex):
+            df = df.reset_index()
+
+        candles = _df_to_candles(df)
+
+    # --- CSV (no pandas needed) ---
+    else:
+        print(f"  Reading CSV: {os.path.basename(filepath)}")
+        candles = []
+        with open(filepath, 'r') as f:
+            reader = csv.DictReader(f)
+            headers = reader.fieldnames
+            time_col, open_col, high_col, low_col, close_col = _detect_columns(headers)
+
+            if not all([open_col, high_col, low_col, close_col]):
+                print(f"  ERROR: Can't identify OHLC columns in {filepath}")
+                print(f"  Headers found: {headers}")
+                return []
+
+            for row in reader:
+                try:
+                    ts = row[time_col].strip()
+                    for fmt in ('%Y-%m-%d %H:%M:%S', '%Y-%m-%dT%H:%M:%S', '%Y.%m.%d %H:%M',
+                                '%Y-%m-%dT%H:%M:%S.%fZ', '%Y-%m-%d %H:%M'):
+                        try:
+                            dt = datetime.strptime(ts, fmt)
+                            break
+                        except ValueError:
+                            continue
+                    else:
+                        continue
+
+                    candles.append({
+                        'time': dt,
+                        'open': float(row[open_col]),
+                        'high': float(row[high_col]),
+                        'low': float(row[low_col]),
+                        'close': float(row[close_col]),
+                    })
+                except (ValueError, KeyError):
+                    continue
 
     candles.sort(key=lambda c: c['time'])
     print(f"  Loaded {len(candles)} M5 candles for {pair} ({candles[0]['time']} to {candles[-1]['time']})" if candles else f"  No candles loaded for {pair}")
@@ -637,8 +731,8 @@ def main():
             pair_data[pair] = candles
 
     if not pair_data:
-        print("\nERROR: No candle data loaded. Check your CSV files.")
-        print(f"Expected files in {data_dir}/: " + ", ".join(f"{p}_M5.csv" for p in needed_pairs))
+        print("\nERROR: No candle data loaded. Check your data files.")
+        print(f"Expected files in {data_dir}/: " + ", ".join(f"{p}_M5.parquet/.feather/.csv" for p in needed_pairs))
         sys.exit(1)
 
     # Simulate each trade
