@@ -72,7 +72,7 @@ class Config:
     # NOT a trailing stop — discrete ratcheting levels that lock in profit.
     # The trade keeps its original 130-pip TP, but if it reverses after running
     # deep into the green, the stop catches it at a locked-in profit level.
-    USE_PROFIT_LOCK = True
+    USE_PROFIT_LOCK = False  # DISABLED — simulation showed all configs cut winners short
     PROFIT_LOCK_LEVELS = [
         # (trigger_pips, lock_pips) — when profit reaches trigger, move SL to lock
         (60, 0),     # At +1R (60p profit): move SL to breakeven
@@ -84,7 +84,7 @@ class Config:
     # ===== MOMENTUM-FADE EXIT =====
     # When a trade is significantly in profit but momentum is dying, close early.
     # This captures the "it's +80 pips but it's never getting to 130" scenario.
-    USE_MOMENTUM_FADE_EXIT = True
+    USE_MOMENTUM_FADE_EXIT = False  # DISABLED — never triggered on real trades, adds complexity for no benefit
     MOMENTUM_FADE_MIN_PROFIT_PIPS = 50   # Only consider fade exit if +50 pips
     MOMENTUM_FADE_RSI_REVERSAL = 15      # RSI moved 15+ points back from extreme
 
