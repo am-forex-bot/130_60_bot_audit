@@ -1,46 +1,32 @@
 #!/usr/bin/env python3
 """
-Simulate stepped profit lock + momentum fade exit on real tick/candle data.
+Simulate stepped profit lock + momentum fade exit on real S5 (5-second) candle data.
 
 USAGE:
-  1. Download M5 (5-minute) candle data from OANDA for the pairs you traded.
-     Supports Parquet, Feather, or CSV formats.
+  1. Place your S5 parquet files in a folder, named like:
+       GBP_USD_S5_20191101_20260303.parquet
+       AUD_USD_S5_20191101_20260303.parquet
+       EUR_USD_S5_20191101_20260303.parquet
 
-  2. Place the data files in a folder, named like:
-       GBP_USD_M5.parquet   (or .feather or .csv)
-       AUD_USD_M5.parquet
-       EUR_USD_M5.parquet
-       EUR_GBP_M5.parquet
-     Also accepts: GBPUSD_M5.parquet, GBP_USD.parquet, etc.
+  2. Run:  python3 simulate_exits.py ./data_folder/
 
-  3. Run:  python3 simulate_exits.py ./data_folder/
+  Requirements: pip install pandas pyarrow numpy
 
-  Requirements for Parquet/Feather: pip install pandas pyarrow
-
-  The script will replay every bar for each trade and tell you exactly:
-  - Did the trade reach each profit lock level?
-  - When did momentum fade trigger (if ever)?
-  - What would the P&L have been under each exit strategy?
-
-ALTERNATIVE — OANDA API DOWNLOAD:
-  If you have the OANDA API token, the script can download directly.
-  Run:  python3 simulate_exits.py --download
+  The script will:
+  - Load only the relevant date range from each parquet (fast, skips years of data)
+  - Replay every 5-second bar for each trade (near-tick precision)
+  - Aggregate S5→M5 for RSI/MACD momentum fade indicators
+  - Tell you exactly what each exit strategy would have done
 """
 
-import csv
 import os
 import sys
-
-try:
-    import pandas as pd
-    HAS_PANDAS = True
-except ImportError:
-    HAS_PANDAS = False
 import json
+import glob
 import numpy as np
+import pandas as pd
 from datetime import datetime, timedelta
-from dataclasses import dataclass
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional
 
 
 # ==================== CONFIGURATION ====================
@@ -143,19 +129,22 @@ TRADES = [
 
 # Profit lock levels: (trigger_pips, lock_pips)
 PROFIT_LOCK_LEVELS = [
-    (60, 0),     # At +60p: breakeven
-    (80, 30),    # At +80p: lock +30
-    (100, 50),   # At +100p: lock +50
-    (115, 70),   # At +115p: lock +70
+    (60, 0),     # At +60p: move SL to breakeven
+    (80, 30),    # At +80p: lock +30 pips
+    (100, 50),   # At +100p: lock +50 pips
+    (115, 70),   # At +115p: lock +70 pips
 ]
 
-# Momentum fade parameters
-FADE_MIN_PROFIT = 50    # pips
+# Momentum fade parameters (calculated on M5 bars)
+FADE_MIN_PROFIT = 50    # pips — must be this far in profit
 FADE_RSI_PERIOD = 14
 FADE_RSI_REVERSAL = 15  # RSI must reverse by this many points
 FADE_MACD_FAST = 12
 FADE_MACD_SLOW = 26
 FADE_MACD_SIGNAL = 9
+
+# How far back to load for indicator warmup
+DATA_LOOKBACK_DAYS = 3  # Load from Mar 1 for trades on Mar 2-3
 
 
 # ==================== HELPERS ====================
@@ -163,12 +152,18 @@ FADE_MACD_SIGNAL = 9
 def pip_mult(pair):
     return 100 if 'JPY' in pair else 10000
 
+
+def pip_val(pair):
+    return 0.01 if 'JPY' in pair else 0.0001
+
+
 def calc_profit_pips(pair, direction, entry, current):
     mult = pip_mult(pair)
     if direction == 'buy':
         return (current - entry) * mult
     else:
         return (entry - current) * mult
+
 
 def calc_rsi(closes, period=14):
     """Calculate RSI from close prices array."""
@@ -193,6 +188,7 @@ def calc_rsi(closes, period=14):
     rsi = 100 - (100 / (1 + rs))
     return rsi
 
+
 def calc_macd_hist(closes, fast=12, slow=26, signal=9):
     """Calculate MACD histogram from close prices."""
     if len(closes) < slow + signal:
@@ -204,6 +200,7 @@ def calc_macd_hist(closes, fast=12, slow=26, signal=9):
     signal_line = _ema(macd_line, signal)
     return macd_line - signal_line
 
+
 def _ema(data, period):
     """Exponential moving average."""
     ema = np.zeros_like(data, dtype=float)
@@ -214,175 +211,124 @@ def _ema(data, period):
     return ema
 
 
-# ==================== LOAD M5 DATA ====================
+# ==================== LOAD S5 DATA ====================
 
-def _detect_columns(headers):
-    """Detect OHLC and time column names from headers (case-insensitive)."""
-    headers_lower = [h.lower() for h in headers]
-    time_col = None
-    for h, hl in zip(headers, headers_lower):
-        if hl in ('time', 'datetime', 'date', 'timestamp'):
-            time_col = h
-            break
-    if not time_col:
-        time_col = headers[0]
+def find_s5_file(data_dir: str, pair: str) -> Optional[str]:
+    """Find S5 parquet/feather file for a pair using glob patterns."""
+    # Try parquet first, then feather
+    for ext in ['parquet', 'feather']:
+        # Pattern: GBP_USD_S5_*.parquet
+        pattern = os.path.join(data_dir, f"{pair}_S5_*.{ext}")
+        matches = glob.glob(pattern)
+        if matches:
+            return matches[0]
 
-    open_col = next((h for h, hl in zip(headers, headers_lower) if hl in ('open', 'o', 'mid_o', 'mid.o')), None)
-    high_col = next((h for h, hl in zip(headers, headers_lower) if hl in ('high', 'h', 'mid_h', 'mid.h')), None)
-    low_col = next((h for h, hl in zip(headers, headers_lower) if hl in ('low', 'l', 'mid_l', 'mid.l')), None)
-    close_col = next((h for h, hl in zip(headers, headers_lower) if hl in ('close', 'c', 'mid_c', 'mid.c')), None)
+        # Also try without underscore: GBPUSD_S5_*.parquet
+        pair_no_sep = pair.replace('_', '')
+        pattern = os.path.join(data_dir, f"{pair_no_sep}_S5_*.{ext}")
+        matches = glob.glob(pattern)
+        if matches:
+            return matches[0]
 
-    return time_col, open_col, high_col, low_col, close_col
+        # Exact name: GBP_USD_S5.parquet
+        fp = os.path.join(data_dir, f"{pair}_S5.{ext}")
+        if os.path.exists(fp):
+            return fp
 
-
-def _df_to_candles(df) -> List[Dict]:
-    """Convert a pandas DataFrame to list of candle dicts."""
-    headers = list(df.columns)
-    time_col, open_col, high_col, low_col, close_col = _detect_columns(headers)
-
-    if not all([open_col, high_col, low_col, close_col]):
-        print(f"  ERROR: Can't identify OHLC columns")
-        print(f"  Columns found: {headers}")
-        return []
-
-    candles = []
-    for _, row in df.iterrows():
-        try:
-            ts = row[time_col]
-            if isinstance(ts, str):
-                for fmt in ('%Y-%m-%d %H:%M:%S', '%Y-%m-%dT%H:%M:%S', '%Y.%m.%d %H:%M',
-                            '%Y-%m-%dT%H:%M:%S.%fZ', '%Y-%m-%d %H:%M'):
-                    try:
-                        dt = datetime.strptime(ts.strip(), fmt)
-                        break
-                    except ValueError:
-                        continue
-                else:
-                    continue
-            else:
-                dt = pd.Timestamp(ts).to_pydatetime()
-
-            candles.append({
-                'time': dt,
-                'open': float(row[open_col]),
-                'high': float(row[high_col]),
-                'low': float(row[low_col]),
-                'close': float(row[close_col]),
-            })
-        except (ValueError, KeyError, TypeError):
-            continue
-
-    return candles
+    return None
 
 
-def load_m5_data(data_dir: str, pair: str) -> List[Dict]:
-    """Load M5 candle data from Parquet, Feather, or CSV.
+def load_s5_data(data_dir: str, pair: str) -> Optional[pd.DataFrame]:
+    """Load S5 candle data from parquet, filtering to only the relevant date range.
 
-    Supports multiple file formats and naming conventions:
-      Parquet:  GBP_USD_M5.parquet, GBPUSD_M5.parquet, GBP_USD.parquet
-      Feather:  GBP_USD_M5.feather, GBPUSD_M5.feather, GBP_USD.feather
-      CSV:      GBP_USD_M5.csv, GBPUSD_M5.csv, GBP_USD.csv
-
-    Columns auto-detected (case-insensitive):
-      time/datetime/date/timestamp, open/o/mid_o, high/h/mid_h, low/l/mid_l, close/c/mid_c
+    Uses pyarrow predicate pushdown to skip reading years of irrelevant data.
+    Returns a DataFrame with columns: time, open, high, low, close
+    Time column is naive datetime (UTC stripped).
     """
-    # Build filename patterns: base names × extensions
-    bases = [
-        f"{pair}_M5",
-        f"{pair.replace('_', '')}_M5",
-        f"{pair}_5min",
-        f"{pair}",
-        f"{pair.replace('_', '')}",
-    ]
-    extensions = ['.parquet', '.feather', '.csv']
-
-    filepath = None
-    for base in bases:
-        for ext in extensions:
-            fp = os.path.join(data_dir, base + ext)
-            if os.path.exists(fp):
-                filepath = fp
-                break
-        if filepath:
-            break
-
+    filepath = find_s5_file(data_dir, pair)
     if not filepath:
-        all_tried = [b + e for b in bases for e in extensions]
-        print(f"  WARNING: No M5 data found for {pair} in {data_dir}")
-        print(f"  Tried: {', '.join(all_tried[:6])}...")
-        return []
+        print(f"  WARNING: No S5 data found for {pair} in {data_dir}")
+        print(f"  Expected: {pair}_S5_YYYYMMDD_YYYYMMDD.parquet")
+        return None
 
     ext = os.path.splitext(filepath)[1].lower()
+    basename = os.path.basename(filepath)
+    print(f"  Loading {basename}...")
 
-    # --- Parquet / Feather (need pandas) ---
-    if ext in ('.parquet', '.feather'):
-        if not HAS_PANDAS:
-            print(f"  ERROR: Found {filepath} but pandas is not installed.")
-            print(f"  Install with: pip install pandas pyarrow")
-            return []
+    # Calculate date range: we need indicator warmup before earliest trade
+    earliest_trade = min(datetime.fromisoformat(t['entry_time']) for t in TRADES)
+    load_from = earliest_trade - timedelta(days=DATA_LOOKBACK_DAYS)
+    load_from_ts = pd.Timestamp(load_from, tz='UTC')
 
-        print(f"  Reading {ext[1:].upper()}: {os.path.basename(filepath)}")
-        try:
-            if ext == '.parquet':
-                df = pd.read_parquet(filepath)
-            else:
-                df = pd.read_feather(filepath)
-        except Exception as e:
-            print(f"  ERROR reading {filepath}: {e}")
-            return []
+    try:
+        if ext == '.parquet':
+            # Use pyarrow predicate pushdown — only reads relevant row groups
+            df = pd.read_parquet(
+                filepath,
+                filters=[('time', '>=', load_from_ts)],
+                columns=['time', 'open', 'high', 'low', 'close', 'volume'],
+            )
+        else:
+            # Feather doesn't support predicate pushdown, load all and filter
+            df = pd.read_feather(filepath)
+            df = df[df['time'] >= load_from_ts]
+            df = df[['time', 'open', 'high', 'low', 'close', 'volume']]
+    except Exception as e:
+        print(f"  ERROR reading {filepath}: {e}")
+        return None
 
-        # If the index is a DatetimeIndex, bring it into columns
-        if isinstance(df.index, pd.DatetimeIndex):
-            df = df.reset_index()
+    if df.empty:
+        print(f"  WARNING: No data found for {pair} after {load_from}")
+        return None
 
-        candles = _df_to_candles(df)
+    # Strip timezone to naive datetime for simpler comparison
+    if df['time'].dt.tz is not None:
+        df['time'] = df['time'].dt.tz_localize(None)
 
-    # --- CSV (no pandas needed) ---
-    else:
-        print(f"  Reading CSV: {os.path.basename(filepath)}")
-        candles = []
-        with open(filepath, 'r') as f:
-            reader = csv.DictReader(f)
-            headers = reader.fieldnames
-            time_col, open_col, high_col, low_col, close_col = _detect_columns(headers)
+    df = df.sort_values('time').reset_index(drop=True)
 
-            if not all([open_col, high_col, low_col, close_col]):
-                print(f"  ERROR: Can't identify OHLC columns in {filepath}")
-                print(f"  Headers found: {headers}")
-                return []
+    t0 = df['time'].iloc[0]
+    t1 = df['time'].iloc[-1]
+    print(f"  Loaded {len(df):,} S5 bars for {pair} ({t0} to {t1})")
 
-            for row in reader:
-                try:
-                    ts = row[time_col].strip()
-                    for fmt in ('%Y-%m-%d %H:%M:%S', '%Y-%m-%dT%H:%M:%S', '%Y.%m.%d %H:%M',
-                                '%Y-%m-%dT%H:%M:%S.%fZ', '%Y-%m-%d %H:%M'):
-                        try:
-                            dt = datetime.strptime(ts, fmt)
-                            break
-                        except ValueError:
-                            continue
-                    else:
-                        continue
+    return df
 
-                    candles.append({
-                        'time': dt,
-                        'open': float(row[open_col]),
-                        'high': float(row[high_col]),
-                        'low': float(row[low_col]),
-                        'close': float(row[close_col]),
-                    })
-                except (ValueError, KeyError):
-                    continue
 
-    candles.sort(key=lambda c: c['time'])
-    print(f"  Loaded {len(candles)} M5 candles for {pair} ({candles[0]['time']} to {candles[-1]['time']})" if candles else f"  No candles loaded for {pair}")
-    return candles
+def aggregate_s5_to_m5(s5_df: pd.DataFrame) -> pd.DataFrame:
+    """Aggregate S5 (5-second) bars into M5 (5-minute) bars."""
+    df = s5_df.set_index('time')
+    m5 = df.resample('5min').agg({
+        'open': 'first',
+        'high': 'max',
+        'low': 'min',
+        'close': 'last',
+        'volume': 'sum',
+    }).dropna()
+    m5 = m5.reset_index()
+    return m5
+
+
+def build_m5_indicators(m5_df: pd.DataFrame) -> pd.DataFrame:
+    """Pre-compute RSI and MACD histogram on M5 data."""
+    closes = m5_df['close'].values
+
+    rsi = calc_rsi(closes, FADE_RSI_PERIOD)
+    macd_hist = calc_macd_hist(closes, FADE_MACD_FAST, FADE_MACD_SLOW, FADE_MACD_SIGNAL)
+
+    m5_df = m5_df.copy()
+    m5_df['rsi'] = rsi
+    m5_df['macd_hist'] = macd_hist
+    return m5_df
 
 
 # ==================== SIMULATE ====================
 
-def simulate_trade(trade: Dict, candles: List[Dict]) -> Dict:
-    """Simulate a single trade against M5 candle data with all three exit strategies."""
+def simulate_trade(trade: Dict, s5_df: pd.DataFrame, m5_ind: pd.DataFrame) -> Dict:
+    """Simulate a single trade against S5 candle data with all three exit strategies.
+
+    Uses S5 bars for price-level checks (SL/TP/profit lock) — 5-second precision.
+    Uses pre-computed M5 indicators for momentum fade detection.
+    """
 
     pair = trade['pair']
     direction = trade['direction']
@@ -391,28 +337,26 @@ def simulate_trade(trade: Dict, candles: List[Dict]) -> Dict:
     sl = trade['sl_price']
     tp = trade['tp_price']
     mult = pip_mult(pair)
-    pip_val = 0.01 if 'JPY' in pair else 0.0001
+    pv = pip_val(pair)
 
-    # Filter candles to trade's lifetime (and some before for indicators)
-    lookback = [c for c in candles if c['time'] < entry_time][-50:]  # 50 bars before for RSI/MACD
-    trade_candles = [c for c in candles if c['time'] >= entry_time]
+    # Filter S5 bars to trade's lifetime
+    trade_bars = s5_df[s5_df['time'] >= entry_time].copy()
 
-    if not trade_candles:
-        return {"error": f"No candle data found for {pair} after {entry_time}"}
+    if trade_bars.empty:
+        return {"error": f"No S5 data found for {pair} after {entry_time}"}
 
-    all_candles = lookback + trade_candles
-    closes = np.array([c['close'] for c in all_candles])
-
-    # Pre-calculate indicators on full series
-    rsi_series = calc_rsi(closes, FADE_RSI_PERIOD)
-    macd_hist_series = calc_macd_hist(closes, FADE_MACD_FAST, FADE_MACD_SLOW, FADE_MACD_SIGNAL)
+    # Convert M5 indicators to a lookup: for any time, find nearest completed M5 bar
+    m5_times = m5_ind['time'].values  # numpy datetime64 array
+    m5_rsi = m5_ind['rsi'].values
+    m5_macd = m5_ind['macd_hist'].values
 
     # Track state
     max_profit_pips = 0.0
     min_profit_pips = 0.0
     current_sl = sl  # Will be ratcheted by profit lock
+    max_profit_time = entry_time
 
-    # Results for each strategy
+    # Results
     result = {
         "trade_id": trade['id'],
         "pair": pair,
@@ -446,65 +390,83 @@ def simulate_trade(trade: Dict, candles: List[Dict]) -> Dict:
         # Excursion data
         "max_favorable_pips": 0.0,
         "max_adverse_pips": 0.0,
-        "time_in_green_bars": 0,
-        "time_in_red_bars": 0,
-        "bars_to_max_profit": 0,
+        "max_profit_time": None,
+        "seconds_in_green": 0,
+        "seconds_in_red": 0,
+        "total_bars": 0,
 
-        # Per-bar trace (for plotting)
+        # Per-minute trace (sampled from S5 for reasonable file size)
         "bar_trace": [],
     }
 
-    offset = len(lookback)  # Index offset into indicator arrays
     combined_exited = False
     lock_exited = False
     fade_exited = False
+    trace_counter = 0
 
-    for i, candle in enumerate(trade_candles):
-        idx = offset + i  # Index into full indicator arrays
+    # Iterate S5 bars
+    times = trade_bars['time'].values
+    opens = trade_bars['open'].values
+    highs = trade_bars['high'].values
+    lows = trade_bars['low'].values
+    closes = trade_bars['close'].values
 
-        # Use high/low to check SL/TP hits within the bar
+    for i in range(len(trade_bars)):
+        bar_time = pd.Timestamp(times[i]).to_pydatetime()
+        bar_open = opens[i]
+        bar_high = highs[i]
+        bar_low = lows[i]
+        bar_close = closes[i]
+
+        # Calculate profit at extremes
         if direction == 'sell':
-            # For shorts: high checks SL, low checks TP
-            bar_worst = candle['high']   # Worst price for short
-            bar_best = candle['low']     # Best price for short
-            bar_exit = candle['close']   # Where we'd actually exit
+            bar_best = bar_low
+            bar_worst = bar_high
         else:
-            bar_worst = candle['low']
-            bar_best = candle['high']
-            bar_exit = candle['close']
+            bar_best = bar_high
+            bar_worst = bar_low
 
         profit_at_best = calc_profit_pips(pair, direction, entry, bar_best)
         profit_at_worst = calc_profit_pips(pair, direction, entry, bar_worst)
-        profit_at_close = calc_profit_pips(pair, direction, entry, candle['close'])
+        profit_at_close = calc_profit_pips(pair, direction, entry, bar_close)
 
         # Track max excursion
         if profit_at_best > max_profit_pips:
             max_profit_pips = profit_at_best
-            result['bars_to_max_profit'] = i
+            max_profit_time = bar_time
         if profit_at_worst < min_profit_pips:
             min_profit_pips = profit_at_worst
 
         if profit_at_close > 0:
-            result['time_in_green_bars'] += 1
+            result['seconds_in_green'] += 5
         else:
-            result['time_in_red_bars'] += 1
+            result['seconds_in_red'] += 5
+        result['total_bars'] += 1
 
-        # Record bar trace
-        result['bar_trace'].append({
-            'time': candle['time'].isoformat(),
-            'profit_pips': round(profit_at_close, 1),
-            'max_profit': round(max_profit_pips, 1),
-            'rsi': round(rsi_series[idx], 1) if idx < len(rsi_series) else None,
-        })
+        # Sample trace every 12 bars (= 1 minute)
+        trace_counter += 1
+        if trace_counter >= 12:
+            # Look up M5 RSI for this time
+            m5_idx = np.searchsorted(m5_times, times[i], side='right') - 1
+            current_m5_rsi = float(m5_rsi[m5_idx]) if 0 <= m5_idx < len(m5_rsi) else None
+
+            result['bar_trace'].append({
+                'time': bar_time.strftime('%H:%M:%S'),
+                'price': round(bar_close, 5),
+                'profit_pips': round(profit_at_close, 1),
+                'mfe': round(max_profit_pips, 1),
+                'rsi_m5': round(current_m5_rsi, 1) if current_m5_rsi else None,
+            })
+            trace_counter = 0
 
         # --- CHECK ORIGINAL SL/TP ---
         hit_original_sl = (
-            (direction == 'sell' and candle['high'] >= sl) or
-            (direction == 'buy' and candle['low'] <= sl)
+            (direction == 'sell' and bar_high >= sl) or
+            (direction == 'buy' and bar_low <= sl)
         )
         hit_original_tp = (
-            (direction == 'sell' and candle['low'] <= tp) or
-            (direction == 'buy' and candle['high'] >= tp)
+            (direction == 'sell' and bar_low <= tp) or
+            (direction == 'buy' and bar_high >= tp)
         )
 
         # --- PROFIT LOCK: Check if we should ratchet SL ---
@@ -513,10 +475,10 @@ def simulate_trade(trade: Dict, candles: List[Dict]) -> Dict:
                 if profit_at_best >= trigger_pips:
                     # Calculate new SL
                     if direction == 'buy':
-                        new_sl = entry + (lock_pips * pip_val)
+                        new_sl = entry + (lock_pips * pv)
                         sl_improved = new_sl > current_sl
                     else:
-                        new_sl = entry - (lock_pips * pip_val)
+                        new_sl = entry - (lock_pips * pv)
                         sl_improved = new_sl < current_sl
 
                     if sl_improved:
@@ -524,29 +486,32 @@ def simulate_trade(trade: Dict, candles: List[Dict]) -> Dict:
                         if level_name not in [l['level'] for l in result['lock_levels_hit']]:
                             result['lock_levels_hit'].append({
                                 'level': level_name,
-                                'time': candle['time'].isoformat(),
+                                'time': bar_time.strftime('%Y-%m-%dT%H:%M:%S'),
                                 'profit_at_trigger': round(profit_at_best, 1),
                             })
                         current_sl = new_sl
                     break
 
-            # Check if ratcheted SL is now hit
-            hit_ratcheted_sl = (
-                (direction == 'sell' and candle['high'] >= current_sl and current_sl != sl) or
-                (direction == 'buy' and candle['low'] <= current_sl and current_sl != sl)
-            )
+            # Check if ratcheted SL is now hit (only if it's been moved from original)
+            if current_sl != sl:
+                hit_ratcheted_sl = (
+                    (direction == 'sell' and bar_high >= current_sl) or
+                    (direction == 'buy' and bar_low <= current_sl)
+                )
+            else:
+                hit_ratcheted_sl = False
 
             if hit_ratcheted_sl:
                 lock_pips_captured = calc_profit_pips(pair, direction, entry, current_sl)
                 result['lock_exit_price'] = current_sl
-                result['lock_exit_time'] = candle['time'].isoformat()
+                result['lock_exit_time'] = bar_time.strftime('%Y-%m-%dT%H:%M:%S')
                 result['lock_exit_pips'] = round(lock_pips_captured, 1)
                 result['lock_exit_reason'] = 'profit_lock_sl'
                 lock_exited = True
 
                 if not combined_exited:
                     result['combined_exit_price'] = current_sl
-                    result['combined_exit_time'] = candle['time'].isoformat()
+                    result['combined_exit_time'] = bar_time.strftime('%Y-%m-%dT%H:%M:%S')
                     result['combined_exit_pips'] = round(lock_pips_captured, 1)
                     result['combined_exit_reason'] = 'profit_lock'
                     combined_exited = True
@@ -554,14 +519,14 @@ def simulate_trade(trade: Dict, candles: List[Dict]) -> Dict:
             elif hit_original_tp and not lock_exited:
                 tp_pips = calc_profit_pips(pair, direction, entry, tp)
                 result['lock_exit_price'] = tp
-                result['lock_exit_time'] = candle['time'].isoformat()
+                result['lock_exit_time'] = bar_time.strftime('%Y-%m-%dT%H:%M:%S')
                 result['lock_exit_pips'] = round(tp_pips, 1)
                 result['lock_exit_reason'] = 'take_profit'
                 lock_exited = True
 
                 if not combined_exited:
                     result['combined_exit_price'] = tp
-                    result['combined_exit_time'] = candle['time'].isoformat()
+                    result['combined_exit_time'] = bar_time.strftime('%Y-%m-%dT%H:%M:%S')
                     result['combined_exit_pips'] = round(tp_pips, 1)
                     result['combined_exit_reason'] = 'take_profit'
                     combined_exited = True
@@ -569,133 +534,83 @@ def simulate_trade(trade: Dict, candles: List[Dict]) -> Dict:
             elif hit_original_sl and not lock_exited:
                 sl_pips = calc_profit_pips(pair, direction, entry, sl)
                 result['lock_exit_price'] = sl
-                result['lock_exit_time'] = candle['time'].isoformat()
+                result['lock_exit_time'] = bar_time.strftime('%Y-%m-%dT%H:%M:%S')
                 result['lock_exit_pips'] = round(sl_pips, 1)
                 result['lock_exit_reason'] = 'stop_loss'
                 lock_exited = True
 
                 if not combined_exited:
                     result['combined_exit_price'] = sl
-                    result['combined_exit_time'] = candle['time'].isoformat()
+                    result['combined_exit_time'] = bar_time.strftime('%Y-%m-%dT%H:%M:%S')
                     result['combined_exit_pips'] = round(sl_pips, 1)
                     result['combined_exit_reason'] = 'stop_loss'
                     combined_exited = True
 
         # --- MOMENTUM FADE: Check if momentum is dying while in profit ---
-        if not fade_exited and profit_at_close >= FADE_MIN_PROFIT and idx >= FADE_RSI_PERIOD + 5:
-            current_rsi = rsi_series[idx]
-            rsi_5_bars_ago = rsi_series[idx - 5]
-            current_macd_hist = macd_hist_series[idx]
-            prev_macd_hist = macd_hist_series[idx - 3]
+        if not fade_exited and profit_at_close >= FADE_MIN_PROFIT:
+            # Look up M5 indicators at current time
+            m5_idx = np.searchsorted(m5_times, times[i], side='right') - 1
+            if m5_idx >= 5:  # Need at least 5 M5 bars of history
+                current_rsi = m5_rsi[m5_idx]
+                rsi_5_bars_ago = m5_rsi[m5_idx - 5]
+                current_macd = m5_macd[m5_idx]
+                prev_macd = m5_macd[m5_idx - 3]
 
-            fade_triggered = False
-            if direction == 'sell':
-                # Short: RSI was low and rising (momentum fading), MACD hist rising
-                rsi_reversal = current_rsi - rsi_5_bars_ago
-                macd_fading = current_macd_hist > prev_macd_hist
-                if rsi_reversal > FADE_RSI_REVERSAL and macd_fading:
-                    fade_triggered = True
-            else:
-                # Long: RSI was high and dropping, MACD hist declining
-                rsi_reversal = rsi_5_bars_ago - current_rsi
-                macd_fading = current_macd_hist < prev_macd_hist
-                if rsi_reversal > FADE_RSI_REVERSAL and macd_fading:
-                    fade_triggered = True
+                fade_triggered = False
+                if direction == 'sell':
+                    # Short: RSI was low (oversold) and now rising = momentum fading
+                    rsi_reversal = current_rsi - rsi_5_bars_ago
+                    macd_fading = current_macd > prev_macd
+                    if rsi_reversal > FADE_RSI_REVERSAL and macd_fading:
+                        fade_triggered = True
+                else:
+                    # Long: RSI was high (overbought) and now dropping
+                    rsi_reversal = rsi_5_bars_ago - current_rsi
+                    macd_fading = current_macd < prev_macd
+                    if rsi_reversal > FADE_RSI_REVERSAL and macd_fading:
+                        fade_triggered = True
 
-            if fade_triggered:
-                result['fade_triggered'] = True
-                result['fade_exit_price'] = candle['close']
-                result['fade_exit_time'] = candle['time'].isoformat()
-                result['fade_exit_pips'] = round(profit_at_close, 1)
-                result['fade_rsi_at_trigger'] = round(current_rsi, 1)
-                fade_exited = True
+                if fade_triggered:
+                    result['fade_triggered'] = True
+                    result['fade_exit_price'] = bar_close
+                    result['fade_exit_time'] = bar_time.strftime('%Y-%m-%dT%H:%M:%S')
+                    result['fade_exit_pips'] = round(profit_at_close, 1)
+                    result['fade_rsi_at_trigger'] = round(float(current_rsi), 1)
+                    fade_exited = True
 
-                if not combined_exited:
-                    result['combined_exit_price'] = candle['close']
-                    result['combined_exit_time'] = candle['time'].isoformat()
-                    result['combined_exit_pips'] = round(profit_at_close, 1)
-                    result['combined_exit_reason'] = 'momentum_fade'
-                    combined_exited = True
+                    if not combined_exited:
+                        result['combined_exit_price'] = bar_close
+                        result['combined_exit_time'] = bar_time.strftime('%Y-%m-%dT%H:%M:%S')
+                        result['combined_exit_pips'] = round(profit_at_close, 1)
+                        result['combined_exit_reason'] = 'momentum_fade'
+                        combined_exited = True
 
-        # If both lock and fade have exited (or original SL/TP hit), stop
+        # If both lock and fade have resolved, stop
         if lock_exited and fade_exited:
             break
+        # If original SL/TP hit, ensure everything is recorded and stop
         if hit_original_sl or hit_original_tp:
             if not lock_exited:
-                pips = calc_profit_pips(pair, direction, entry, trade['actual_exit_price'])
+                exit_pips = calc_profit_pips(pair, direction, entry, trade['actual_exit_price'])
                 result['lock_exit_price'] = trade['actual_exit_price']
-                result['lock_exit_time'] = candle['time'].isoformat()
-                result['lock_exit_pips'] = round(pips, 1)
+                result['lock_exit_time'] = bar_time.strftime('%Y-%m-%dT%H:%M:%S')
+                result['lock_exit_pips'] = round(exit_pips, 1)
                 result['lock_exit_reason'] = trade['actual_exit_reason']
                 lock_exited = True
             if not combined_exited:
-                pips = calc_profit_pips(pair, direction, entry, trade['actual_exit_price'])
+                exit_pips = calc_profit_pips(pair, direction, entry, trade['actual_exit_price'])
                 result['combined_exit_price'] = trade['actual_exit_price']
-                result['combined_exit_time'] = candle['time'].isoformat()
-                result['combined_exit_pips'] = round(pips, 1)
+                result['combined_exit_time'] = bar_time.strftime('%Y-%m-%dT%H:%M:%S')
+                result['combined_exit_pips'] = round(exit_pips, 1)
                 result['combined_exit_reason'] = trade['actual_exit_reason']
                 combined_exited = True
             break
 
     result['max_favorable_pips'] = round(max_profit_pips, 1)
     result['max_adverse_pips'] = round(abs(min_profit_pips), 1)
+    result['max_profit_time'] = max_profit_time.strftime('%Y-%m-%dT%H:%M:%S')
 
     return result
-
-
-# ==================== DOWNLOAD FROM OANDA ====================
-
-def download_oanda_data(output_dir: str):
-    """Download M5 data from OANDA API for the last 3 days."""
-    import requests
-
-    token = os.getenv('OANDA_ACCESS_TOKEN', '')
-    account_id = os.getenv('OANDA_ACCOUNT_ID', '')
-    env = os.getenv('OANDA_ENV', 'practice')
-
-    if not token:
-        print("ERROR: Set OANDA_ACCESS_TOKEN environment variable")
-        print("  export OANDA_ACCESS_TOKEN='your-token-here'")
-        sys.exit(1)
-
-    base_url = 'https://api-fxpractice.oanda.com' if env == 'practice' else 'https://api-fxtrade.oanda.com'
-    headers = {'Authorization': f'Bearer {token}'}
-
-    os.makedirs(output_dir, exist_ok=True)
-
-    pairs = ['GBP_USD', 'AUD_USD', 'EUR_USD', 'EUR_GBP']
-    from_time = (datetime.utcnow() - timedelta(days=3)).strftime('%Y-%m-%dT00:00:00Z')
-
-    for pair in pairs:
-        print(f"Downloading {pair} M5 data...")
-        url = f"{base_url}/v3/instruments/{pair}/candles"
-        params = {
-            'granularity': 'M5',
-            'from': from_time,
-            'count': 5000,
-            'price': 'M',  # Mid prices
-        }
-        resp = requests.get(url, headers=headers, params=params)
-        if resp.status_code != 200:
-            print(f"  ERROR: {resp.status_code} — {resp.text[:200]}")
-            continue
-
-        candles = resp.json().get('candles', [])
-        filepath = os.path.join(output_dir, f"{pair}_M5.csv")
-        with open(filepath, 'w', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow(['time', 'open', 'high', 'low', 'close', 'volume'])
-            for c in candles:
-                if c.get('complete', True):
-                    mid = c['mid']
-                    writer.writerow([
-                        c['time'][:19].replace('T', ' '),
-                        mid['o'], mid['h'], mid['l'], mid['c'],
-                        c.get('volume', 0)
-                    ])
-        print(f"  Saved {len(candles)} candles to {filepath}")
-
-    print(f"\nData saved to {output_dir}/")
 
 
 # ==================== MAIN ====================
@@ -703,56 +618,61 @@ def download_oanda_data(output_dir: str):
 def main():
     if len(sys.argv) < 2:
         print(__doc__)
-        print("\nQuick start:")
-        print("  python3 simulate_exits.py --download        # Download from OANDA API")
-        print("  python3 simulate_exits.py ./my_data_folder/  # Use local CSV files")
+        print("\nUsage:  python3 simulate_exits.py ./your_data_folder/")
+        print("\nExpected files like: GBP_USD_S5_20191101_20260303.parquet")
         sys.exit(1)
 
-    if sys.argv[1] == '--download':
-        data_dir = './m5_data'
-        download_oanda_data(data_dir)
-    else:
-        data_dir = sys.argv[1]
+    data_dir = sys.argv[1]
 
     if not os.path.exists(data_dir):
         print(f"ERROR: Data directory '{data_dir}' not found")
         sys.exit(1)
 
     print("\n" + "=" * 90)
-    print("LOADING M5 CANDLE DATA")
+    print("LOADING S5 CANDLE DATA (5-second bars)")
     print("=" * 90)
 
-    # Load data for all pairs
-    pair_data = {}
-    needed_pairs = set(t['pair'] for t in TRADES)
-    for pair in needed_pairs:
-        candles = load_m5_data(data_dir, pair)
-        if candles:
-            pair_data[pair] = candles
+    needed_pairs = sorted(set(t['pair'] for t in TRADES))
+    pair_s5 = {}
+    pair_m5_ind = {}
 
-    if not pair_data:
-        print("\nERROR: No candle data loaded. Check your data files.")
-        print(f"Expected files in {data_dir}/: " + ", ".join(f"{p}_M5.parquet/.feather/.csv" for p in needed_pairs))
+    for pair in needed_pairs:
+        print(f"\n  --- {pair} ---")
+        s5_df = load_s5_data(data_dir, pair)
+        if s5_df is None:
+            continue
+
+        pair_s5[pair] = s5_df
+
+        # Aggregate to M5 and compute indicators
+        m5_df = aggregate_s5_to_m5(s5_df)
+        m5_ind = build_m5_indicators(m5_df)
+        pair_m5_ind[pair] = m5_ind
+        print(f"  Aggregated to {len(m5_df):,} M5 bars for indicator calculation")
+
+    if not pair_s5:
+        print(f"\nERROR: No candle data loaded.")
+        print(f"Expected files in {data_dir}/: " + ", ".join(f"{p}_S5_*.parquet" for p in needed_pairs))
         sys.exit(1)
 
     # Simulate each trade
     print("\n" + "=" * 90)
-    print("SIMULATING EXIT STRATEGIES ON EACH TRADE")
+    print("SIMULATING EXIT STRATEGIES — 5-SECOND PRECISION")
     print("=" * 90)
 
     results = []
     for trade in TRADES:
         pair = trade['pair']
-        if pair not in pair_data:
+        if pair not in pair_s5:
             print(f"\n  Skipping {trade['id']} — no data for {pair}")
             continue
 
         print(f"\n{'─' * 80}")
         print(f"Trade: {trade['id']} | {pair} {trade['direction'].upper()} @ {trade['entry_price']}")
         print(f"  Entry: {trade['entry_time']}  |  Actual exit: {trade['actual_exit_reason']} at {trade['actual_exit_time']}")
-        print(f"  Post-TP re-entry: {'YES' if trade['was_post_tp_reentry'] else 'No'}")
+        print(f"  Post-TP re-entry: {'YES — WOULD BE BLOCKED BY COOLDOWN' if trade['was_post_tp_reentry'] else 'No'}")
 
-        result = simulate_trade(trade, pair_data[pair])
+        result = simulate_trade(trade, pair_s5[pair], pair_m5_ind[pair])
 
         if 'error' in result:
             print(f"  ERROR: {result['error']}")
@@ -761,45 +681,54 @@ def main():
         results.append(result)
 
         # Print excursion analysis
-        print(f"\n  PRICE EXCURSION:")
-        print(f"    Max favorable (MFE): +{result['max_favorable_pips']} pips (reached at bar {result['bars_to_max_profit']})")
+        print(f"\n  PRICE EXCURSION (5-second precision):")
+        print(f"    Max favorable (MFE): +{result['max_favorable_pips']} pips at {result['max_profit_time']}")
         print(f"    Max adverse (MAE):   -{result['max_adverse_pips']} pips")
-        print(f"    Time in green: {result['time_in_green_bars']} bars | Time in red: {result['time_in_red_bars']} bars")
+        green_min = result['seconds_in_green'] // 60
+        red_min = result['seconds_in_red'] // 60
+        print(f"    Time in profit: {green_min}m | Time in loss: {red_min}m | S5 bars processed: {result['total_bars']:,}")
 
         # Print profit lock results
         print(f"\n  PROFIT LOCK:")
         if result['lock_levels_hit']:
             for lvl in result['lock_levels_hit']:
-                print(f"    Hit {lvl['level']} at {lvl['time']} (profit was +{lvl['profit_at_trigger']}p)")
+                print(f"    >> HIT {lvl['level']} at {lvl['time']} (profit was +{lvl['profit_at_trigger']}p)")
         else:
-            print(f"    No lock levels reached (max profit was +{result['max_favorable_pips']}p, first trigger at +60p)")
-        print(f"    Lock exit: {result['lock_exit_reason']} at {result['lock_exit_pips']}p")
+            print(f"    No lock levels reached (MFE was +{result['max_favorable_pips']}p, first trigger at +60p)")
+        if result['lock_exit_reason']:
+            print(f"    Lock exit: {result['lock_exit_reason']} at {result['lock_exit_pips']:+.1f}p ({result['lock_exit_time']})")
 
         # Print momentum fade results
         print(f"\n  MOMENTUM FADE:")
         if result['fade_triggered']:
-            print(f"    TRIGGERED at {result['fade_exit_time']} — closed at +{result['fade_exit_pips']}p")
+            print(f"    >> TRIGGERED at {result['fade_exit_time']} — closed at +{result['fade_exit_pips']}p")
             print(f"    RSI at trigger: {result['fade_rsi_at_trigger']}")
         else:
             print(f"    Not triggered (needed +{FADE_MIN_PROFIT}p profit with RSI reversal of {FADE_RSI_REVERSAL}+)")
 
-        # Print comparison
+        # Print comparison table
         print(f"\n  COMPARISON:")
-        print(f"    {'Strategy':<25} {'Exit':>8} {'Pips':>8} {'vs Actual':>10}")
-        print(f"    {'─' * 55}")
+        print(f"    {'Strategy':<25} {'Exit Reason':>15} {'Pips':>8} {'vs Actual':>10}")
+        print(f"    {'─' * 60}")
         actual_pips = result['actual_pnl_pips']
-        print(f"    {'Actual (no changes)':<25} {result['actual_exit']:>8} {actual_pips:>+8.1f} {'':>10}")
+        print(f"    {'Actual (no changes)':<25} {result['actual_exit']:>15} {actual_pips:>+8.1f} {'—':>10}")
+
         if result['lock_exit_pips'] is not None:
             diff = result['lock_exit_pips'] - actual_pips
-            print(f"    {'With profit lock':<25} {result['lock_exit_reason']:>8} {result['lock_exit_pips']:>+8.1f} {diff:>+10.1f}")
+            marker = ' <<<' if diff > 5 else ''
+            print(f"    {'With profit lock':<25} {result['lock_exit_reason']:>15} {result['lock_exit_pips']:>+8.1f} {diff:>+10.1f}{marker}")
+
         if result['fade_triggered']:
             diff = result['fade_exit_pips'] - actual_pips
-            print(f"    {'With momentum fade':<25} {'fade':>8} {result['fade_exit_pips']:>+8.1f} {diff:>+10.1f}")
+            marker = ' <<<' if diff > 5 else ''
+            print(f"    {'With momentum fade':<25} {'momentum_fade':>15} {result['fade_exit_pips']:>+8.1f} {diff:>+10.1f}{marker}")
+
         if result['combined_exit_pips'] is not None:
             diff = result['combined_exit_pips'] - actual_pips
-            print(f"    {'Combined (first exit)':<25} {result['combined_exit_reason']:>8} {result['combined_exit_pips']:>+8.1f} {diff:>+10.1f}")
+            marker = ' <<<' if diff > 5 else ''
+            print(f"    {'Combined (first exit)':<25} {result['combined_exit_reason']:>15} {result['combined_exit_pips']:>+8.1f} {diff:>+10.1f}{marker}")
 
-    # Final summary
+    # ==================== FINAL SUMMARY ====================
     if results:
         print("\n" + "=" * 90)
         print("OVERALL SUMMARY")
@@ -809,45 +738,47 @@ def main():
         lock_total = sum(r['lock_exit_pips'] for r in results if r['lock_exit_pips'] is not None)
         combined_total = sum(r['combined_exit_pips'] for r in results if r['combined_exit_pips'] is not None)
 
-        # Count where each strategy improved things
         lock_improved = sum(1 for r in results if r['lock_exit_pips'] is not None and r['lock_exit_pips'] > r['actual_pnl_pips'])
         lock_worse = sum(1 for r in results if r['lock_exit_pips'] is not None and r['lock_exit_pips'] < r['actual_pnl_pips'])
+        lock_same = sum(1 for r in results if r['lock_exit_pips'] is not None and abs(r['lock_exit_pips'] - r['actual_pnl_pips']) < 0.5)
         fade_count = sum(1 for r in results if r['fade_triggered'])
 
-        print(f"\n  {'Metric':<35} {'Actual':>10} {'Lock':>10} {'Combined':>10}")
+        print(f"\n  {'Metric':<35} {'Actual':>10} {'Profit Lock':>12} {'Combined':>10}")
         print(f"  {'─' * 70}")
-        print(f"  {'Total pips':<35} {actual_total:>+10.1f} {lock_total:>+10.1f} {combined_total:>+10.1f}")
-        print(f"  {'Improvement over actual':<35} {'':>10} {lock_total - actual_total:>+10.1f} {combined_total - actual_total:>+10.1f}")
-        print(f"  {'Trades improved':<35} {'':>10} {lock_improved:>10} {'':>10}")
-        print(f"  {'Trades worse':<35} {'':>10} {lock_worse:>10} {'':>10}")
-        print(f"  {'Momentum fade triggers':<35} {'':>10} {'':>10} {fade_count:>10}")
+        print(f"  {'Total pips':<35} {actual_total:>+10.1f} {lock_total:>+12.1f} {combined_total:>+10.1f}")
+        print(f"  {'Improvement over actual':<35} {'—':>10} {lock_total - actual_total:>+12.1f} {combined_total - actual_total:>+10.1f}")
+        print(f"  {'Trades improved':<35} {'':>10} {lock_improved:>12} {'':>10}")
+        print(f"  {'Trades same outcome':<35} {'':>10} {lock_same:>12} {'':>10}")
+        print(f"  {'Trades worse':<35} {'':>10} {lock_worse:>12} {'':>10}")
+        print(f"  {'Momentum fade triggers':<35} {'':>10} {'':>12} {fade_count:>10}")
 
-        print(f"\n  With post-TP cooldown ALSO applied:")
+        # Post-TP cooldown impact
+        print(f"\n  POST-TP COOLDOWN (60 min, independent of above):")
         cooldown_blocked = [r for r in results if r['was_post_tp_reentry']]
         cooldown_saved_pips = sum(abs(r['actual_pnl_pips']) for r in cooldown_blocked if r['actual_pnl_pips'] < 0)
-        print(f"    Trades blocked by cooldown: {len(cooldown_blocked)}")
-        print(f"    Additional pips saved: +{cooldown_saved_pips:.1f}")
-        print(f"    Grand total improvement: +{combined_total - actual_total + cooldown_saved_pips:.1f} pips")
+        for r in cooldown_blocked:
+            print(f"    BLOCKED: {r['trade_id']} — would have saved {abs(r['actual_pnl_pips']):.1f} pips (£{abs(r['actual_pnl_gbp']):.0f})")
+        print(f"    Total trades blocked: {len(cooldown_blocked)}")
+        print(f"    Total pips saved: +{cooldown_saved_pips:.1f}")
 
-    # Save detailed results as JSON
+        # Grand total
+        all_improvement = (combined_total - actual_total) + cooldown_saved_pips
+        print(f"\n  {'=' * 60}")
+        print(f"  GRAND TOTAL (all strategies combined): {all_improvement:+.1f} pips improvement")
+        print(f"  {'=' * 60}")
+
+    # Save results
     output_file = os.path.join(data_dir, 'simulation_results.json')
-    # Remove bar_trace for cleaner output (it's huge)
-    clean_results = []
-    for r in results:
-        cr = {k: v for k, v in r.items() if k != 'bar_trace'}
-        clean_results.append(cr)
-
+    clean_results = [{k: v for k, v in r.items() if k != 'bar_trace'} for r in results]
     with open(output_file, 'w') as f:
         json.dump(clean_results, f, indent=2, default=str)
     print(f"\n  Detailed results saved to: {output_file}")
 
-    # Also save bar traces for plotting
     trace_file = os.path.join(data_dir, 'bar_traces.json')
     traces = {r['trade_id']: r['bar_trace'] for r in results}
     with open(trace_file, 'w') as f:
         json.dump(traces, f, indent=2, default=str)
-    print(f"  Bar-by-bar traces saved to: {trace_file}")
-    print(f"\n  Use bar_traces.json to plot the profit curve for each trade")
+    print(f"  Per-minute profit traces saved to: {trace_file}")
 
 
 if __name__ == '__main__':
