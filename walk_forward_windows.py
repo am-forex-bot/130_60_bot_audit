@@ -707,10 +707,10 @@ else:
 
 def simulate_all_trades(signals: pd.DataFrame, s5: pd.DataFrame,
                         pair: str) -> pd.DataFrame:
-    """Simulate all signals against S5 data. Returns trades with outcomes.
+    """Simulate signals against S5 data with ONE-TRADE-AT-A-TIME constraint.
 
-    This is the expensive step — but each trade is independent so we
-    process them sequentially with the numba-jitted inner loop.
+    Like the live bot: no new signal on this pair while a trade is open.
+    Signals that fire during an open trade are skipped entirely.
     """
     if signals.empty:
         return pd.DataFrame()
@@ -735,6 +735,10 @@ def simulate_all_trades(signals: pd.DataFrame, s5: pd.DataFrame,
 
     total = len(signals)
     report_every = max(1, total // 20)
+    skipped = 0
+
+    # Track when this pair becomes free (S5 index after trade resolves)
+    pair_free_after_idx = 0
 
     for j in range(total):
         if j % report_every == 0:
@@ -743,6 +747,11 @@ def simulate_all_trades(signals: pd.DataFrame, s5: pd.DataFrame,
 
         start_idx = s5_start_indices[j]
         if start_idx >= len(s5_high):
+            continue
+
+        # ONE-TRADE-AT-A-TIME: skip if pair still has open trade
+        if start_idx < pair_free_after_idx:
+            skipped += 1
             continue
 
         entry = sig_entries[j]
@@ -764,7 +773,12 @@ def simulate_all_trades(signals: pd.DataFrame, s5: pd.DataFrame,
         elif outcome == -1:
             pips = -SL_PIPS
         else:
-            continue  # Skip trades that never resolved
+            # Trade never resolved — pair is blocked until end of data
+            pair_free_after_idx = len(s5_high)
+            continue
+
+        # Block pair until this trade resolves
+        pair_free_after_idx = start_idx + bars + 1
 
         results.append({
             'time': sig_times[j],
@@ -779,7 +793,8 @@ def simulate_all_trades(signals: pd.DataFrame, s5: pd.DataFrame,
             'duration_bars': bars,
         })
 
-    print(f"\r    Simulating trades: 100% ({total:,}/{total:,})  ")
+    print(f"\r    Simulating trades: 100% ({total:,}/{total:,}) — "
+          f"{len(results):,} taken, {skipped:,} skipped (pair busy)  ")
 
     return pd.DataFrame(results) if results else pd.DataFrame()
 
@@ -994,10 +1009,10 @@ def process_pair(data_dir: str, pair: str) -> Optional[pd.DataFrame]:
         hurst_at_m5 = np.full(len(m5), 0.5)
     print(f"[{_time.time()-t3:.1f}s]")
 
-    # 7. Order flow (on M1, mapped back to M5)
+    # 7. Order flow (on M1, aggregated from S5 — NOT from M5)
     t4 = _time.time()
-    print(f"  Computing order flow...", end=" ", flush=True)
-    m1 = aggregate_to_timeframe(m5, '1min')
+    print(f"  Computing order flow (S5→M1)...", end=" ", flush=True)
+    m1 = aggregate_to_timeframe(s5, '1min')
     if len(m1) > 100:
         m1 = compute_order_flow_vec(m1)
         m1_times = m1['time'].values
