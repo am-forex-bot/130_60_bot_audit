@@ -736,6 +736,7 @@ def simulate_all_trades(signals: pd.DataFrame, s5: pd.DataFrame,
     total = len(signals)
     report_every = max(1, total // 20)
     skipped = 0
+    unresolved = 0
 
     # Track when this pair becomes free (S5 index after trade resolves)
     pair_free_after_idx = 0
@@ -764,21 +765,23 @@ def simulate_all_trades(signals: pd.DataFrame, s5: pd.DataFrame,
             tp_price = entry - TP_PIPS * pv
             sl_price = entry + SL_PIPS * pv
 
+        # No artificial cap — scan all remaining S5 bars like the real bot
+        remaining = len(s5_high) - start_idx
         outcome, bars = _simulate_trade_numba(
-            s5_high, s5_low, start_idx, d, entry, tp_price, sl_price
+            s5_high, s5_low, start_idx, d, entry, tp_price, sl_price,
+            max_bars=remaining
         )
+
+        # Block pair until this trade resolves (or end of data if unresolved)
+        pair_free_after_idx = start_idx + bars + 1
 
         if outcome == 1:
             pips = TP_PIPS
         elif outcome == -1:
             pips = -SL_PIPS
         else:
-            # Trade never resolved — pair is blocked until end of data
-            pair_free_after_idx = len(s5_high)
-            continue
-
-        # Block pair until this trade resolves
-        pair_free_after_idx = start_idx + bars + 1
+            unresolved += 1
+            continue  # Trade still open at end of data — can't score it
 
         results.append({
             'time': sig_times[j],
@@ -794,7 +797,8 @@ def simulate_all_trades(signals: pd.DataFrame, s5: pd.DataFrame,
         })
 
     print(f"\r    Simulating trades: 100% ({total:,}/{total:,}) — "
-          f"{len(results):,} taken, {skipped:,} skipped (pair busy)  ")
+          f"{len(results):,} taken, {skipped:,} skipped (pair busy), "
+          f"{unresolved} unresolved (still open at end of data)  ")
 
     return pd.DataFrame(results) if results else pd.DataFrame()
 
